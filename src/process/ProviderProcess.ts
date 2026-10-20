@@ -203,6 +203,11 @@ export interface ProviderProcessStopOptions {
   readonly cleanupResult?: ProcessCleanupResult;
   readonly terminationGraceMs?: number;
   readonly killGraceMs?: number;
+  /**
+   * Bounded wait for output streams to close after verified cleanup, before
+   * capture listeners are detached, so late diagnostics are still collected.
+   */
+  readonly outputSettleMs?: number;
 }
 
 /** Exact disposition of one owned process stop attempt. */
@@ -234,14 +239,23 @@ export const spawnOwnedProviderProcess = async (
   await prepareProcessOwnershipInspection(options.signal);
   options.signal?.throwIfAborted();
   const platform = options.platform ?? process.platform;
-  const sweepTokenOwnedProcesses =
+  // A requested sweep is part of the cleanup contract, never an optional
+  // optimization. Hosts without identity baselines must refuse before launch.
+  const requiresTokenSweep =
     options.sweepTokenOwnedProcesses === true && platform !== "win32";
+  const captureOwnershipBaseline = requiresTokenSweep
+    ? systemProcessOwnershipHost.captureBaseline
+    : undefined;
+  if (requiresTokenSweep && captureOwnershipBaseline === undefined)
+    throw Object.assign(
+      new Error(
+        "Token-owned process cleanup requires a host ownership baseline; use a supported Linux or macOS host (or Windows Job Objects).",
+      ),
+      { code: "ERR_PROCESS_OWNERSHIP_UNAVAILABLE" },
+    );
   let captureBaseline: ProcessOwnershipBaseline | undefined;
-  if (sweepTokenOwnedProcesses) {
-    const capture = systemProcessOwnershipHost.captureBaseline;
-    if (capture === undefined)
-      throw new Error("Process ownership baseline is unavailable on this host");
-    captureBaseline = await capture(options.signal);
+  if (captureOwnershipBaseline !== undefined) {
+    captureBaseline = await captureOwnershipBaseline(options.signal);
     options.signal?.throwIfAborted();
   }
   const hostEnvironment = options.hostEnvironment ?? process.env;
@@ -297,7 +311,7 @@ export const spawnOwnedProviderProcess = async (
     processGroupId: pid,
     expectedParentPid: process.pid,
     evidenceOwner: new ProcessOwnershipEvidenceOwner(),
-    ...(sweepTokenOwnedProcesses
+    ...(requiresTokenSweep
       ? {
           sweepTokenOwnedProcesses: true,
           captureBaseline: captureBaseline!,
@@ -654,6 +668,10 @@ export class ProviderProcessSupervisor {
         }
       }
       if (!completed) this.unref();
+      else if (options.outputSettleMs !== undefined)
+        await this.waitForOutputClose(options.outputSettleMs).catch(
+          () => undefined,
+        );
       return result;
     } finally {
       if (completed) this.dispose();

@@ -55,6 +55,12 @@ it.each([
   "run > /tmp/out",
   "set inferior-t /dev/null",
   "with inferior-t /dev/null -- run",
+  'interpreter-exec console "shell sleep 3600 &"',
+  'interpreter-exec mi "-gdb-exit"',
+  "interp console run",
+  'eval "shell sleep 1"',
+  "pipe print 1 | cat",
+  "info files | less",
 ])("rejects one-shot command %s before starting GDB", async (inputCommand) => {
   const manager = {
     start: vi.fn(),
