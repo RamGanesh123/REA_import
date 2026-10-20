@@ -12,8 +12,86 @@ import { connectLocalToolsMcp } from "../../fixtures/localToolsMcp.js";
 
 const execute = promisify(execFile);
 
-it("preserves earlier and sibling effects without inventing replaced cached-module or process effects", async () => {
-  const root = await createTestTempDirectory("rea-builtin-identity-");
+const writeReceiverReviewSources = async (root: string): Promise<void> => {
+  const sources = [
+    "const getter={get:()=>({})};getter.get=()=>module;const box={};box.owner=getter.get();Object.assign=(t,v)=>{v.require=replacement};Object.assign({},box.owner);require('fs').readFileSync('wrong-replaced-getter');",
+    "class Box{owner=module}Object.assign=(t,v)=>{v.owner.require=replacement};Object.assign({},new Box());require('fs').readFileSync('wrong-constructor-module-field');",
+    "const get=Object.prototype.valueOf.bind(module);Object.assign=(t,f)=>{f().require=replacement};Object.assign({},get);require('fs').readFileSync('wrong-bound-this');",
+    "const fs=require('fs');Reflect.set=(Reflect.set(fs,'readFileSync',custom,{}),other);fs.readFileSync('nested-write-kept.json');",
+    "Reflect.set(module,'require',replacement,(0,{}));require('fs').readFileSync('fresh-sequence-receiver.json');",
+    "const fs=require('fs');Reflect.set(fs,'reviewHook',1,{fs});fs.readFileSync('late-prototype-kept.json');Object.defineProperty(Object.prototype,'reviewHook',{set(v){this.fs.readFileSync=custom}});",
+    "function get(){return module}Object.assign=(t,v)=>{v.require=replacement};Object.assign({},get());require('fs').readFileSync('wrong-returned-module');",
+    "const holder={child:{}},box={},cfg={receiver:{}};box.owner=holder.child;const set=Reflect.set.bind(null,holder,'child',{},cfg.receiver);cfg.receiver=holder;set();holder.child.owner=module;Object.assign=custom;Object.assign({},box.owner);require('fs').readFileSync('wrong-captured-receiver');",
+    "const holder={child:{}},box={};Object.defineProperty(holder,'child',{value:{},configurable:false});box.owner=holder.child;Reflect.defineProperty(holder,'child',{value:{},configurable:true});holder.child.owner=module;Object.assign=custom;Object.assign({},box.owner);require('fs').readFileSync('wrong-rejected-definition');",
+    "const holder={child:{}},box={};box.owner=holder.child;Reflect.set(holder,'child',{},{});holder.child.owner=module;Object.assign=custom;Object.assign({},box.owner);require('fs').readFileSync('wrong-possible-replacement');",
+    "const holder={child:{}},box={};box.owner=holder.child;Object.freeze(holder);holder.child={};holder.child.owner=module;Object.assign=custom;Object.assign({},box.owner);require('fs').readFileSync('wrong-frozen-replacement');",
+    "const bound=Reflect.set.bind(null,module);Reflect.set(Reflect,'set',bound,(0,Reflect));Reflect.set('require',replacement);require('fs').readFileSync('wrong-sequence-bound');",
+    "Reflect.set(module,'require',replacement,1+2);require('fs').readFileSync('receiver-expression.json');",
+    "const fs=require('fs');const remove=Reflect.deleteProperty.bind(null,fs,'readFileSync');remove();fs.readFileSync('wrong-bound-delete');",
+    "const holder={child:{}},box={};box.owner=holder.child;Reflect.defineProperty(holder,'child',{value:{}});holder.child.owner=module;Object.assign=custom;Object.assign({},box.owner);require('fs').readFileSync('native-replacement-define.json');",
+    "const holder={child:{}},box={};box.owner=holder.child;Reflect.set(holder,'child',{});holder.child.owner=module;Object.assign=custom;Object.assign({},box.owner);require('fs').readFileSync('native-replacement-set.json');",
+    "let holder={child:{}};const box={};const set=Reflect.set.bind(null,holder,'child',{});holder={child:{}};box.owner=holder.child;set();holder.child.owner=module;Object.assign=custom;Object.assign({},box.owner);require('fs').readFileSync('wrong-captured-native-target');",
+    "const holder={inner:{child:{}}},box={};const set=Reflect.set.bind(null,holder.inner,'child',{});holder.inner={child:{}};box.owner=holder.inner.child;set();holder.inner.child.owner=module;Object.assign=custom;Object.assign({},box.owner);require('fs').readFileSync('wrong-captured-member-target');",
+    "const holder={inner:{child:{}}},box={};const set=Reflect.set.bind(null,holder.inner,'child',{});box.owner=holder.inner.child;set();holder.inner.child.owner=module;Object.assign=custom;Object.assign({},box.owner);require('fs').readFileSync('native-member-kept.json');",
+    "const bound=Reflect.set.bind(null,module);Reflect.set(Reflect,'set',bound,flag?Reflect:Reflect);Reflect.set('require',replacement);require('fs').readFileSync('wrong-conditional-receiver');",
+    "import fs from 'node:fs';Reflect.set(fs,'readFileSync',custom);fs.readFileSync('wrong-default-set');",
+    "const holder={child:{}}; const box={}; box.owner=holder.child; outer:{if(flag)break outer;holder.child={};} holder.child.owner=module; Object.assign=custom;Object.assign({},box.owner);require('fs').readFileSync('wrong-labeled-allocation');",
+    "const holder={child:{}}; const box={}; box.owner=holder.child; do{if(flag)continue;holder.child={};}while(false);holder.child.owner=module;Object.assign=custom;Object.assign({},box.owner);require('fs').readFileSync('wrong-loop-allocation');",
+    "const box={};function install(){Object.defineProperty(box,'owner',{writable:true});}install();Object.assign=custom;Object.assign({},box.owner);require('fs').readFileSync('deferred-descriptor.json');Object.prototype.value=module;",
+    "const box={};(()=>Reflect.defineProperty(box,'owner',{writable:true}))();Object.assign=custom;Object.assign({},box.owner);require('fs').readFileSync('immediate-descriptor.json');Object.prototype.value=module;",
+    "const box={};function install(){Object.defineProperty(box,'owner',{writable:true});}Object.prototype.value=module;install();Object.assign=custom;Object.assign({},box.owner);require('fs').readFileSync('wrong-inherited-descriptor');",
+    "const box={}; box.owner=1; Object.assign=custom; Object.assign({},box.owner); require('fs').readFileSync('harmless-written.json');",
+    "const box={}; Object.defineProperties(box,{owner:{value:1}}); Object.assign=custom; Object.assign({},box.owner); require('fs').readFileSync('harmless-descriptor.json');",
+    "Object.defineProperty(Reflect,'set',{value:Reflect.set.bind(null,module)}); Reflect.set('require',replacement); require('fs').readFileSync('wrong-descriptor-bound');",
+    "Object.assign(Reflect,{set:Reflect.set.bind(null,module)}); Reflect.set('require',replacement); require('fs').readFileSync('wrong-copied-bound');",
+    "Object.assign(Reflect,{other:Reflect.set.bind(null,module)}); Reflect.set({},'require',replacement); require('fs').readFileSync('copied-unrelated.json');",
+    "const fs=require('fs'); Reflect.set(module,'require',replacement,{fs}); fs.readFileSync('wrapper-descriptor-before.json'); module.require=other;",
+    "Reflect.set=Reflect.set.bind(null,module); Reflect.set('require',replacement); require('fs').readFileSync('wrong-assigned-bound-set');",
+    "Object.assign=Object.assign.bind(null,module); Object.assign({require:replacement}); require('fs').readFileSync('wrong-assigned-bound-assign');",
+    "Reflect.set=Reflect.set.bind(null,{}); Reflect.set('require',replacement); require('fs').readFileSync('bound-separate.json');",
+    "Object.create.call=()=>module; const r=Object.create.call(null,null); Reflect.set(r,'require',custom); require('fs').readFileSync('wrong-create');",
+    "const fs=require('fs'); const r={fs,set hook(v){this.fs.readFileSync=custom;}}; Reflect.set(r,'hook',1); fs.readFileSync('wrong-setter');",
+    "import fs = require('fs'); fs={}; fs={}; fs.readFileSync('wrong-entry');",
+    "const fs=require('fs'); Reflect.set(fs,'readFileSync',custom,{}); fs.readFileSync('receiver-data.json');",
+    "Reflect.set(module,'require',custom,-1); require('fs').readFileSync('receiver-primitive.json');",
+    "let fs; fs=require('fs'),fs.readFileSync('sequence-one.json'),fs={},fs=require('fs'),fs.readFileSync('sequence-two.json');",
+    "const fs=require('fs'); fs.globSync('*'); fs.readFileSync('glob-kept.json');",
+    "let fs=require('fs'); {{fs.readFileSync('nested-timeline.json');}} fs={};",
+    "const fs=require('fs'); const target={__proto__:{set hook(v){this.fs.readFileSync=custom;}}}; Reflect.set(target,'hook',1,{fs}); fs.readFileSync('wrong-inherited-setter');",
+    "const {promises:fsp}=require('fs'); delete require('fs').promises; const handle=fsp.open('saved-promises'); handle.close();",
+    "Object.assign=(target,source)=>{target.require=source.require;}; Object.assign(module,{require:replacement}); require('fs').readFileSync('wrong-opaque-mutator');",
+    "const {promises:fsp}=require('fs'); patch(require('fs/promises')); const h=fsp.open('wrong-escaped-object'); h.close();",
+    "const fs=require('fs'); Reflect.set(Object.create(null),'hook',1,{fs}); fs.readFileSync('null-prototype-kept.json');",
+    "const fs=require('fs'); delete fs.statSync; Object.defineProperty(Object.prototype,'statSync',{set(){this.readFileSync=custom;}}); Reflect.set(fs,'statSync',custom); fs.readFileSync('wrong-removed-descriptor');",
+    "let fs=require('fs'); fs.readFileSync('outer-before-nested.json'); {fs={};}",
+    "const {id}=module; Object.assign=custom; Object.assign({},id); require('fs').readFileSync('projected-scalar.json');",
+    "Reflect.set=custom; Reflect.set({},'x',1); require('fs').readFileSync('opaque-unrelated.json');",
+    "const r=Object.create(null); Object.create=custom; Reflect.set(module,'require',replacement,r); require('fs').readFileSync('allocated-before.json');",
+    "const fs=require('fs'); Reflect.set(fs,'readFileSync',custom,{}); fs.readFileSync('reflect-before.json'); Reflect.set=other;",
+    "const proc=require('process'); Reflect.set(proc,'env',{},{}); const mode=proc.env.SEPARATE_MODE;",
+    "let fs={}; outer:{if(flag)break outer; fs=require('fs');} fs.readFileSync('wrong-skipped-write');",
+    "function run(){const r=Object.create(null); Reflect.set(r,'require',replacement); require('fs').readFileSync('wrong-deferred-loader');} Object.create=()=>module; run();",
+    "function run(){const fs=require('fs'); Reflect.set(fs,'readFileSync',custom,{}); fs.readFileSync('wrong-deferred-set');} Reflect.set=(target,key,value)=>{target[key]=value}; run();",
+    "Reflect.set(module); require('fs').readFileSync('omitted-key.json');",
+    "Reflect.set(module,'require',replacement,require('node:path')); require('fs').readFileSync('namespace-receiver.json');",
+    "Reflect.set(module,'require',replacement,new (class {})()); require('fs').readFileSync('constructed-receiver.json');",
+    "Reflect.set(module,'require',replacement,new (class {constructor(){return module;}})()); require('fs').readFileSync('wrong-constructor-return');",
+    "Object.assign=custom; const box={safe:{id:1},owner:module}; Object.assign({},box.safe); Object.assign({},box.owner); require('fs').readFileSync('wrong-cached-projection');",
+  ];
+  for (const [index, source] of sources.entries())
+    await writeFile(join(root, `receiver-review-${index}.ts`), source);
+  await writeFile(
+    join(root, "namespace-receiver.mjs"),
+    `import * as fs from 'node:fs';
+     Reflect.set(fs,'readFileSync',custom);fs.readFileSync('namespace-set.json');
+     const set=Reflect.set.bind(null,fs);set('readFileSync',custom);
+     fs.readFileSync('namespace-bound-set.json');
+     Reflect.defineProperty(fs,'readFileSync',{value:custom});
+     fs.readFileSync('namespace-descriptor.json');`,
+  );
+};
+
+const writeBuiltinIdentitySources = async (root: string): Promise<void> => {
   await writeFile(
     join(root, "app.cjs"),
     `
@@ -80,6 +158,47 @@ it("preserves earlier and sibling effects without inventing replaced cached-modu
     join(root, "global-process.cjs"),
     `process.env={MODE:'local'}; const proc=require('process'); const mode=proc.env.MODE;`,
   );
+  await writeFile(
+    join(root, "ordered-receivers.cjs"),
+    `let fs=require('fs'); fs.statSync('probe'); fs.readdirSync('probe');
+     fs.readFileSync('ordered-kept.json'); fs={};
+     globalThis.process.cwd(); const proc=require('process'); const mode=proc.env.REVIEW_MODE;`,
+  );
+  await writeFile(
+    join(root, "nested-write.cjs"),
+    `const fs=require('fs'); fs.readFileSync('nested-kept.json');
+     if(flag) { fs.readFileSync=custom; } fs.readFileSync('wrong-nested.json');`,
+  );
+  await writeFile(
+    join(root, "reflect-receiver.cjs"),
+    `Reflect.set(module, 'require', replacement, {});
+     const fs=require('fs'); fs.readFileSync('reflect-receiver-kept.json');`,
+  );
+  await writeFile(
+    join(root, "reflect-module.cjs"),
+    `Reflect.set({}, 'require', replacement, module);
+     const fs=require('fs'); fs.readFileSync('wrong-reflect-module.json');`,
+  );
+  await writeFile(
+    join(root, "reflect-independent.cjs"),
+    `const registry=Object.create(null); Reflect.set(registry, key, replacement);
+     Reflect.set(module, 0, replacement);
+     const fs=require('fs'); Reflect.set(fs, 'require', replacement);
+     require('fs').readFileSync('reflect-independent-kept.json');`,
+  );
+  await writeFile(
+    join(root, "repeated-reads.cjs"),
+    `let fs;
+     fs=require('fs'); fs.readFileSync('timeline-first.json'); fs={};
+     fs=require('fs'); fs.readFileSync('timeline-second.json');
+     fs.readFileSync=custom; fs.readFileSync('wrong-timeline.json');`,
+  );
+};
+
+it("preserves earlier and sibling effects without inventing replaced cached-module or process effects", async () => {
+  const root = await createTestTempDirectory("rea-builtin-identity-");
+  await writeBuiltinIdentitySources(root);
+  await writeReceiverReviewSources(root);
   const { stdout } = await execute(
     process.execPath,
     ["scripts/rea.mjs", "analyze-javascript-application", root, "--json"],
@@ -95,27 +214,67 @@ it("preserves earlier and sibling effects without inventing replaced cached-modu
       .map(({ properties }) => properties.key)
       .sort(),
   ).toEqual([
+    "REVIEW_MODE",
+    "SEPARATE_MODE",
+    "allocated-before.json",
     "before-write.json",
     "before.json",
+    "bound-separate.json",
+    "constructed-receiver.json",
+    "copied-unrelated.json",
+    "deferred-descriptor.json",
     "direct.json",
     "escaped.json",
+    "fresh-sequence-receiver.json",
+    "glob-kept.json",
+    "harmless-descriptor.json",
+    "harmless-written.json",
+    "immediate-descriptor.json",
+    "late-prototype-kept.json",
     "later.json",
     "loader-after.json",
     "loader-before.json",
+    "namespace-bound-set.json",
+    "namespace-descriptor.json",
+    "namespace-receiver.json",
+    "namespace-set.json",
+    "native-member-kept.json",
+    "native-replacement-define.json",
+    "native-replacement-set.json",
+    "nested-kept.json",
+    "nested-timeline.json",
+    "nested-write-kept.json",
+    "null-prototype-kept.json",
+    "omitted-key.json",
+    "opaque-unrelated.json",
+    "ordered-kept.json",
+    "outer-before-nested.json",
+    "projected-scalar.json",
+    "receiver-data.json",
+    "receiver-expression.json",
+    "receiver-primitive.json",
+    "reflect-before.json",
+    "reflect-independent-kept.json",
+    "reflect-receiver-kept.json",
     "replacement-kept.json",
     "saved-destructured.json",
     "saved.json",
+    "sequence-one.json",
+    "sequence-two.json",
     "sibling.json",
+    "timeline-first.json",
+    "timeline-second.json",
     "wrapped-kept.json",
+    "wrapper-descriptor-before.json",
   ]);
   expect(
     result.semantic_graph.nodes.filter(({ kind }) => kind === "resource"),
-  ).toHaveLength(2);
+  ).toHaveLength(3);
   expect(
     result.semantic_graph.relations.filter(
       ({ relation }) => relation === "releases",
     ),
-  ).toHaveLength(1);
+  ).toHaveLength(2);
   const { client, call } = await connectLocalToolsMcp();
   const response = await call("analyze_javascript_application", {
     input_path: root,
@@ -128,6 +287,34 @@ it("preserves earlier and sibling effects without inventing replaced cached-modu
 
 it("excludes monkey-patched CommonJS effects from CLI and MCP evidence", async () => {
   const root = await createTestTempDirectory("rea-builtin-mutated-");
+  await writeFile(
+    join(root, "deferred-setter.cjs"),
+    `const cp=require('child_process'); const fs=require('fs');
+    function run(){Reflect.set(fs,'statSync',1,{cp}); cp.spawn('wrong');}
+    Object.defineProperty(fs,'statSync',{set(v){this.cp.spawn=custom;}}); run();`,
+  );
+  await writeFile(
+    join(root, "stored-loader.cjs"),
+    `Object.assign=(target,value)=>{value.require=replacement};
+    const box={}; const saved=box; box.owner=module;
+    Object.assign({},saved.owner); require('fs').readFileSync('wrong');`,
+  );
+  for (const [index, mutation] of [
+    "Object.assign(module, {[key]: replacement});",
+    "Object.assign(module, {...replacement});",
+    "Reflect.set(module, 'require', replacement);",
+    "let owner=module; owner.require=replacement; owner={};",
+  ].entries()) {
+    await writeFile(
+      join(root, `loader-${index}.cjs`),
+      `${mutation} require('fs').readFileSync('wrong-loader.json');`,
+    );
+  }
+  await writeFile(
+    join(root, "deleted-parent.cjs"),
+    `const fs=require('fs'); delete fs.promises; require('fs').promises.open('wrong');
+     require('tls').createConnection(443);`,
+  );
   await writeFile(
     join(root, "app.cjs"),
     `
@@ -185,6 +372,8 @@ it("retains CommonJS builtin effects and handle links through CLI and MCP", asyn
     throw new Error("This source must only be parsed, never executed");
     const fs = require("node:fs");
     const {spawn: launch} = require("node:child_process");
+    const cp = require("node:child_process");
+    function syncRun() { return cp.spawnSync("tool", []); }
     const timers = require("timers");
     const {get} = require("http");
     const proc = require("node:process");

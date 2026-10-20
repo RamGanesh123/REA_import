@@ -54,6 +54,64 @@ const coverageNode = (): PropertyPathCoverageNode => ({
   selectors: new Map(),
 });
 
+const ensurePath = (
+  root: PropertyPathCoverageNode,
+  path: JavaScriptSemanticPropertyPath,
+): PropertyPathCoverageNode => {
+  let node = root;
+  for (const key of path) {
+    if (key !== null && typeof key !== "object") {
+      const name = String(key);
+      let child = node.exact.get(name);
+      if (child === undefined) {
+        child = coverageNode();
+        node.exact.set(name, child);
+      }
+      node = child;
+    } else {
+      const identity = JSON.stringify(key);
+      let selected = node.selectors.get(identity);
+      if (selected === undefined) {
+        selected = { key, node: coverageNode() };
+        node.selectors.set(identity, selected);
+      }
+      node = selected.node;
+    }
+  }
+  return node;
+};
+
+/** Earliest matching write, indexed by path without scanning unrelated slots. */
+export class SemanticPropertyPathWriteIndex {
+  readonly #root = coverageNode();
+  readonly #offsets = new WeakMap<PropertyPathCoverageNode, number>();
+
+  retain(path: JavaScriptSemanticPropertyPath, offset: number): void {
+    const node = ensurePath(this.#root, path);
+    this.#offsets.set(
+      node,
+      Math.min(this.#offsets.get(node) ?? Infinity, offset),
+    );
+  }
+
+  precedes(path: readonly string[], before: number): boolean {
+    const pending = [{ node: this.#root, offset: 0 }];
+    while (pending.length > 0) {
+      const current = pending.pop()!;
+      if ((this.#offsets.get(current.node) ?? Infinity) < before) return true;
+      const key = path[current.offset];
+      if (key === undefined) continue;
+      const exact = current.node.exact.get(key);
+      if (exact !== undefined)
+        pending.push({ node: exact, offset: current.offset + 1 });
+      for (const selected of current.node.selectors.values())
+        if (semanticPropertyPathKeyMatches(selected.key, key))
+          pending.push({ node: selected.node, offset: current.offset + 1 });
+    }
+    return false;
+  }
+}
+
 /** Index exact effect prefixes without widening distinct member paths. */
 export class SemanticPropertyPathCoverage {
   readonly #root = coverageNode();
@@ -61,26 +119,7 @@ export class SemanticPropertyPathCoverage {
   /** Retain a path only when no previously retained prefix covers it. */
   retain(path: JavaScriptSemanticPropertyPath): boolean {
     if (this.covers(path)) return false;
-    let node = this.#root;
-    for (const key of path) {
-      if (key !== null && typeof key !== "object") {
-        const name = String(key);
-        let child = node.exact.get(name);
-        if (child === undefined) {
-          child = coverageNode();
-          node.exact.set(name, child);
-        }
-        node = child;
-      } else {
-        const identity = JSON.stringify(key);
-        let selected = node.selectors.get(identity);
-        if (selected === undefined) {
-          selected = { key, node: coverageNode() };
-          node.selectors.set(identity, selected);
-        }
-        node = selected.node;
-      }
-    }
+    const node = ensurePath(this.#root, path);
     node.terminal = true;
     node.exact.clear();
     node.selectors.clear();

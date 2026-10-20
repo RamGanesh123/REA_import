@@ -22,9 +22,20 @@ interface StatementPosition {
   readonly declaratorIndex: number;
 }
 
+interface EffectAncestry {
+  readonly position: StatementPosition | null;
+  readonly outer: EffectAncestry | null;
+}
+
+interface SharedEffectPosition {
+  readonly before: StatementPosition;
+  readonly after: StatementPosition;
+}
+
 interface BindingReadPosition {
   readonly position: StatementPosition | null;
   readonly repeating: boolean;
+  readonly outer?: BindingReadPosition;
 }
 
 interface ExpressionSiblings {
@@ -46,10 +57,36 @@ interface ExpressionAncestry {
  * result for as long as its parent map is reachable.
  */
 interface InitializerPositionCache {
+  readonly statementIndices: WeakMap<
+    readonly t.Statement[],
+    ReadonlyMap<t.Statement, number>
+  >;
+  readonly timelines: WeakMap<
+    JavaScriptSemanticBindingState,
+    BindingTimelineCache
+  >;
   readonly direct: WeakMap<t.Node, StatementPosition | null>;
   readonly mutation: WeakMap<t.Node, StatementPosition | null>;
   readonly reference: WeakMap<t.Node, StatementPosition | null>;
+  initializerProjection:
+    | {
+        readonly body: readonly t.Statement[];
+        readonly positions: WeakMap<t.Node, StatementPosition | null>;
+      }
+    | undefined;
+  readonly effect: WeakMap<t.Node, EffectAncestry | null>;
+  effectMatches:
+    | {
+        readonly later: EffectAncestry;
+        readonly byBody: ReadonlyMap<readonly t.Statement[], StatementPosition>;
+        readonly earlier: WeakMap<EffectAncestry, SharedEffectPosition | null>;
+      }
+    | undefined;
   readonly read: WeakMap<t.Node, BindingReadPosition>;
+  readonly readMatches: WeakMap<
+    readonly t.Statement[],
+    WeakMap<BindingReadPosition, StatementPosition | null>
+  >;
   readonly evaluationChildren: WeakMap<
     t.Node,
     ReadonlyMap<t.Node, number> | null
@@ -57,6 +94,9 @@ interface InitializerPositionCache {
   // One source context bounds retained ancestry facts to O(AST), even when
   // an expression contains many distinct writes. Reuse its descendant paths.
   expressionAncestry: ExpressionAncestry | undefined;
+  initializerReads:
+    | { readonly initializer: t.Node; readonly reads: WeakMap<t.Node, boolean> }
+    | undefined;
 }
 
 const initializerPositionCaches = new WeakMap<
@@ -70,12 +110,19 @@ const initializerPositionCache = (
   const cached = initializerPositionCaches.get(parents);
   if (cached !== undefined) return cached;
   const created: InitializerPositionCache = {
+    statementIndices: new WeakMap(),
+    timelines: new WeakMap(),
     direct: new WeakMap(),
     mutation: new WeakMap(),
     reference: new WeakMap(),
+    initializerProjection: undefined,
+    effect: new WeakMap(),
+    effectMatches: undefined,
     read: new WeakMap(),
+    readMatches: new WeakMap(),
     evaluationChildren: new WeakMap(),
     expressionAncestry: undefined,
+    initializerReads: undefined,
   };
   initializerPositionCaches.set(parents, created);
   return created;
@@ -88,7 +135,13 @@ const statementPosition = (
 ): StatementPosition | null => {
   const parent = parents.get(statement);
   if (!t.isProgram(parent) && !t.isBlockStatement(parent)) return null;
-  const index = parent.body.indexOf(statement);
+  const cache = initializerPositionCache(parents).statementIndices;
+  let indices = cache.get(parent.body);
+  if (indices === undefined) {
+    indices = new Map(parent.body.map((node, index) => [node, index]));
+    cache.set(parent.body, indices);
+  }
+  const index = indices.get(statement) ?? -1;
   return index < 0
     ? null
     : {
@@ -111,33 +164,106 @@ const positionPrecedes = (
       left.declaratorIndex >= 0 &&
       left.declaratorIndex < right.declaratorIndex));
 
+/** Share ancestor tails instead of retaining a copied array per capture. */
+const effectAncestry = (
+  start: t.Node | undefined,
+  parents: WeakMap<t.Node, t.Node>,
+): EffectAncestry | null => {
+  if (start === undefined) return null;
+  const cache = initializerPositionCache(parents).effect;
+  const pending: t.Node[] = [];
+  let node: t.Node | undefined = start;
+  while (node !== undefined && !cache.has(node)) {
+    pending.push(node);
+    node = parents.get(node);
+  }
+  let outer = node === undefined ? null : (cache.get(node) ?? null);
+  for (let index = pending.length - 1; index >= 0; index -= 1) {
+    const current = pending[index]!;
+    const parent = pending[index + 1] ?? node;
+    if (t.isProgram(current)) outer = { position: null, outer: null };
+    else if (
+      t.isFunction(current) ||
+      t.isLoop(current) ||
+      delayedInstanceFieldValue(parent, current)
+    )
+      outer = null;
+    else if (outer !== null) {
+      const declarator =
+        t.isVariableDeclarator(current) && t.isVariableDeclaration(parent);
+      const position = declarator
+        ? statementPosition(parent, parents, current)
+        : t.isStatement(current)
+          ? statementPosition(current, parents)
+          : null;
+      if (position !== null) {
+        // A declarator refines its declaration's position, not another level.
+        const tail =
+          declarator &&
+          outer.position?.body === position.body &&
+          outer.position.index === position.index
+            ? outer.outer
+            : outer;
+        outer = { position, outer: tail };
+      }
+    }
+    cache.set(current, outer);
+  }
+  return cache.get(start) ?? null;
+};
+
+/** Source order can prove timing only within one top-level activation. */
+export const semanticTopLevelEffectIsOrderable = (
+  node: t.Node,
+  parents: WeakMap<t.Node, t.Node>,
+): boolean => effectAncestry(node, parents) !== null;
+
 /** Order effects only in a non-repeating top-level activation. */
 export const semanticTopLevelEffectFollowsCapture = (
   capture: t.Node,
   effect: t.Node | undefined,
   parents: WeakMap<t.Node, t.Node>,
 ): boolean => {
-  const position = (node: t.Node | undefined): StatementPosition | null => {
-    let selected: StatementPosition | null = null;
-    let declarator: t.VariableDeclarator | undefined;
-    let child: t.Node | undefined;
-    while (node !== undefined) {
-      if (t.isFunction(node) || t.isLoop(node)) return null;
-      if (delayedInstanceFieldValue(node, child)) return null;
-      if (t.isVariableDeclarator(node)) declarator = node;
-      if (t.isStatement(node)) {
-        const enclosing = statementPosition(node, parents, declarator);
-        if (enclosing !== null) selected = enclosing;
-      }
-      if (t.isProgram(node)) return selected;
-      child = node;
-      node = parents.get(node);
+  const earlier = effectAncestry(capture, parents);
+  const later = effectAncestry(effect, parents);
+  if (earlier === null || later === null) return false;
+  const cache = initializerPositionCache(parents);
+  let matches = cache.effectMatches;
+  if (matches?.later !== later) {
+    const byBody = new Map<readonly t.Statement[], StatementPosition>();
+    for (
+      let entry: EffectAncestry | null = later;
+      entry !== null;
+      entry = entry.outer
+    )
+      if (entry.position !== null && !byBody.has(entry.position.body))
+        byBody.set(entry.position.body, entry.position);
+    matches = { later, byBody, earlier: new WeakMap() };
+    cache.effectMatches = matches;
+  }
+  const pending: EffectAncestry[] = [];
+  let shared: SharedEffectPosition | null = null;
+  for (
+    let entry: EffectAncestry | null = earlier;
+    entry !== null;
+    entry = entry.outer
+  ) {
+    if (matches.earlier.has(entry)) {
+      shared = matches.earlier.get(entry) ?? null;
+      break;
     }
-    return null;
-  };
-  const before = position(capture);
-  const after = position(effect);
-  if (before === null || after === null) return false;
+    pending.push(entry);
+    const before = entry.position;
+    const after = before === null ? undefined : matches.byBody.get(before.body);
+    if (before !== null && after !== undefined) {
+      shared = { before, after };
+      break;
+    }
+  }
+  // Retain only the current effect's matching context, bounding pair storage.
+  for (const entry of pending) matches.earlier.set(entry, shared);
+  if (shared === null) return false;
+  const { before, after } = shared;
   if (positionPrecedes(before, after)) return true;
   if (
     before.body !== after.body ||
@@ -316,6 +442,7 @@ const expressionChildIndices = (
   const cached = cache.get(node);
   if (cached !== undefined) return cached;
   const children = ((): readonly (t.Node | null)[] | null => {
+    if (t.isProgram(node) || t.isBlockStatement(node)) return node.body;
     if (t.isSequenceExpression(node)) return node.expressions;
     if (t.isArrayExpression(node)) return node.elements;
     if (t.isObjectExpression(node)) return node.properties;
@@ -526,6 +653,52 @@ const initializerPosition = (
     : directInitializerPosition(initializer.node, parents);
 };
 
+/** Project nested unconditional blocks into the read's shared statement body. */
+const initializerInBody = (
+  initializer: JavaScriptSemanticBindingState["initializers"][number],
+  parents: WeakMap<t.Node, t.Node>,
+  body: readonly t.Statement[] | undefined,
+  reference = false,
+): StatementPosition | null => {
+  const direct = initializerPosition(initializer, parents, reference);
+  if (direct === null || body === undefined || direct.body === body)
+    return direct;
+  const owner = initializerPositionCache(parents);
+  if (owner.initializerProjection?.body !== body)
+    owner.initializerProjection = { body, positions: new WeakMap() };
+  const cache = owner.initializerProjection.positions;
+  const pending: t.Node[] = [];
+  let current: t.Node | undefined = initializer.node;
+  let result: StatementPosition | null = null;
+  while (current !== undefined) {
+    if (cache.has(current)) {
+      result = cache.get(current) ?? null;
+      break;
+    }
+    pending.push(current);
+    if (t.isStatement(current)) {
+      const position = statementPosition(current, parents);
+      if (position?.body === body) {
+        result = position;
+        break;
+      }
+    }
+    const parent = parents.get(current);
+    if (
+      parent === undefined ||
+      t.isFunction(parent) ||
+      t.isLoop(parent) ||
+      // A labeled break can skip this write while the later read still runs.
+      t.isLabeledStatement(parent) ||
+      semanticBranchMayBeSkipped(parent, current)
+    )
+      break;
+    current = parent;
+  }
+  for (const node of pending) cache.set(node, result);
+  return result;
+};
+
 /** Resolve origins at their use or capture, never at a later transitive effect. */
 export const semanticMutationInitializers = (
   binding: JavaScriptSemanticBindingState,
@@ -535,10 +708,55 @@ export const semanticMutationInitializers = (
   JavaScriptSemanticBindingState,
   "initializers" | "referenceInitializers" | "directOrigins"
 > => {
-  const mutationPosition =
+  const directPosition =
     directMutationPosition(mutation, parents) ??
     referenceInitializerPosition(mutation, parents);
-  if (mutationPosition === null) return binding;
+  if (directPosition === null) return binding;
+  const firstInitializer = binding.initializers[0];
+  const sourcePosition =
+    firstInitializer === undefined
+      ? null
+      : initializerPosition(firstInitializer, parents);
+  const mutationPosition =
+    matchingReadPosition(
+      bindingReadPosition(mutation, parents),
+      sourcePosition?.body,
+      parents,
+    ) ?? directPosition;
+  if (
+    binding.initializers.length > 1 &&
+    binding.referenceInitializers.length === 0
+  ) {
+    const first = mutationPosition.body[0];
+    const indexed =
+      first === undefined ||
+      !t.isProgram(parents.get(first)) ||
+      bindingReadPosition(mutation, parents).repeating
+        ? undefined
+        : readFromTimeline(binding, mutationPosition, mutation, parents);
+    if (indexed !== undefined)
+      return {
+        initializers: indexed.binding.initializers,
+        referenceInitializers: indexed.binding.referenceInitializers,
+        directOrigins: indexed.hasDefiniteInitializer
+          ? []
+          : binding.directOrigins,
+      };
+    const timeline = bindingTimeline(
+      binding,
+      parents,
+      mutationPosition.body,
+    ).timeline;
+    const latest = timeline?.at(-1);
+    if (timeline !== null && latest !== undefined)
+      return positionPrecedes(latest.position, mutationPosition)
+        ? {
+            directOrigins: [],
+            initializers: [latest.initializer],
+            referenceInitializers: [],
+          }
+        : binding;
+  }
   const origins = [
     ...binding.initializers.map((initializer) => ({
       initializer,
@@ -621,10 +839,47 @@ const bindingReadPosition = (
     )
       position = statementPosition(parent, parents);
     if (position !== null && position !== result.position)
-      result = { ...result, position };
+      result = { repeating: result.repeating, position, outer: result };
     cache.set(node, result);
   }
   return result;
+};
+
+/** Keep the nearest shared statement body without crossing an activation. */
+const matchingReadPosition = (
+  read: BindingReadPosition,
+  body: readonly t.Statement[] | undefined,
+  parents: WeakMap<t.Node, t.Node>,
+): StatementPosition | null => {
+  if (body === undefined) return read.position;
+  const matches = initializerPositionCache(parents).readMatches;
+  let cached = matches.get(body);
+  if (cached === undefined) {
+    cached = new WeakMap();
+    matches.set(body, cached);
+  }
+  const pending: BindingReadPosition[] = [];
+  let result: StatementPosition | null = null;
+  for (
+    let current: BindingReadPosition | undefined = read;
+    current !== undefined;
+    current = current.outer
+  ) {
+    const known = cached.get(current);
+    if (known !== undefined) {
+      result = known;
+      break;
+    }
+    pending.push(current);
+    if (current.position?.body === body) {
+      result = current.position;
+      break;
+    }
+  }
+  // Compress the shared chain for this requested body, including misses.
+  // Distinct reads reuse their common outer nodes instead of walking depth N.
+  for (const position of pending) cached.set(position, result);
+  return result ?? read.position;
 };
 
 /** Select a local alias at its read, before any later straight-line reassignment. */
@@ -634,6 +889,150 @@ type SemanticBindingRead = {
   readonly hasDefiniteInitializer: boolean;
   /** Unresolved reads retain all possible origins for conservative alias effects. */
   readonly binding: JavaScriptSemanticBindingState;
+};
+
+interface BindingTimelineCache {
+  readonly body: readonly t.Statement[] | undefined;
+  readonly initializers: JavaScriptSemanticBindingState["initializers"];
+  readonly length: number;
+  readonly references: number;
+  readonly definitions: number;
+  readonly first:
+    | JavaScriptSemanticBindingState["initializers"][number]
+    | undefined;
+  readonly last:
+    | JavaScriptSemanticBindingState["initializers"][number]
+    | undefined;
+  readonly timeline:
+    | readonly {
+        readonly position: StatementPosition;
+        readonly initializer: JavaScriptSemanticBindingState["initializers"][number];
+      }[]
+    | null;
+  readonly entryDefinitions: JavaScriptSemanticBindingState["definitions"];
+}
+
+/** Index definite straight-line writes once; other control flow uses the shared
+ * conservative selector below. Collection appends/copies initializer facts, so
+ * invalidate the index when that owner changes the binding's fact lists.
+ */
+const bindingTimeline = (
+  binding: JavaScriptSemanticBindingState,
+  parents: WeakMap<t.Node, t.Node>,
+  body?: readonly t.Statement[],
+): BindingTimelineCache => {
+  const firstInitializer = binding.initializers[0];
+  body ??=
+    firstInitializer === undefined
+      ? undefined
+      : initializerPosition(firstInitializer, parents)?.body;
+  const cache = initializerPositionCache(parents).timelines;
+  const prior = cache.get(binding);
+  if (
+    prior !== undefined &&
+    prior.body === body &&
+    prior.initializers === binding.initializers &&
+    prior.length === binding.initializers.length &&
+    prior.references === binding.referenceInitializers.length &&
+    prior.definitions === binding.definitions.length &&
+    prior.first === binding.initializers[0] &&
+    prior.last === binding.initializers.at(-1)
+  )
+    return prior;
+  let timeline: NonNullable<BindingTimelineCache["timeline"]>[number][] | null =
+    [];
+  for (const initializer of binding.initializers) {
+    const position = initializerInBody(initializer, parents, body);
+    if (
+      position === null ||
+      initializerMayRetainEntry(initializer, binding, parents) ||
+      (timeline.length > 0 && timeline[0]!.position.body !== position.body)
+    ) {
+      timeline = null;
+      break;
+    }
+    timeline.push({ position, initializer });
+  }
+  timeline?.sort(
+    (a, b) =>
+      a.position.index - b.position.index ||
+      a.position.declaratorIndex - b.position.declaratorIndex ||
+      (a.initializer.node.start ?? 0) - (b.initializer.node.start ?? 0),
+  );
+  if (
+    timeline?.some(
+      (entry, index) =>
+        index > 0 &&
+        !positionPrecedes(timeline![index - 1]!.position, entry.position) &&
+        expressionEvaluationOrder(
+          timeline![index - 1]!.initializer.node,
+          entry.initializer.node,
+          parents,
+        ) !== "before",
+    )
+  )
+    timeline = null;
+  const result: BindingTimelineCache = {
+    body,
+    initializers: binding.initializers,
+    length: binding.initializers.length,
+    references: binding.referenceInitializers.length,
+    definitions: binding.definitions.length,
+    first: binding.initializers[0],
+    last: binding.initializers.at(-1),
+    timeline,
+    entryDefinitions: binding.definitions.filter(
+      ({ kind }) => kind !== "assignment",
+    ),
+  };
+  cache.set(binding, result);
+  return result;
+};
+
+const readFromTimeline = (
+  binding: JavaScriptSemanticBindingState,
+  position: StatementPosition,
+  read: t.Node,
+  parents: WeakMap<t.Node, t.Node>,
+): SemanticBindingRead | undefined => {
+  const index = bindingTimeline(binding, parents, position.body);
+  const timeline = index.timeline;
+  if (timeline === null || timeline[0]?.position.body !== position.body)
+    return undefined;
+  let low = 0,
+    high = timeline.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    const candidate = timeline[middle]!;
+    let precedes = positionPrecedes(candidate.position, position);
+    if (!precedes && !positionPrecedes(position, candidate.position)) {
+      if (readInsideInitializer(read, candidate.initializer.node, parents))
+        precedes = false;
+      else {
+        const order = expressionEvaluationOrder(
+          candidate.initializer.node,
+          read,
+          parents,
+        );
+        if (order === "unresolved") return undefined;
+        precedes = order === "before";
+      }
+    }
+    if (precedes) low = middle + 1;
+    else high = middle;
+  }
+  const entry = timeline[low - 1];
+  return {
+    status: "ordered",
+    hasDefiniteInitializer: entry !== undefined,
+    binding: {
+      ...binding,
+      directOrigins: entry === undefined ? binding.directOrigins : [],
+      initializers: entry === undefined ? [] : [entry.initializer],
+      referenceInitializers: [],
+      definitions: index.entryDefinitions,
+    },
+  };
 };
 
 export const semanticBindingAtRead = (
@@ -649,19 +1048,46 @@ export const semanticBindingAtRead = (
   const initializer = binding.initializers[0];
   const reference = binding.referenceInitializers[0];
   const origin = initializer ?? reference;
-  const sourcePosition =
+  let sourcePosition =
     initializer === undefined
       ? reference === undefined
         ? null
         : initializerPosition(reference, parents, true)
       : initializerPosition(initializer, parents);
-  const { position, repeating } = bindingReadPosition(read, parents);
+  const readPosition = bindingReadPosition(read, parents);
+  const { repeating } = readPosition;
+  const position = matchingReadPosition(
+    readPosition,
+    sourcePosition?.body,
+    parents,
+  );
+  const projectedInitializer =
+    origin !== undefined &&
+    position !== null &&
+    sourcePosition !== null &&
+    sourcePosition.body !== position.body;
+  if (projectedInitializer)
+    sourcePosition = initializerInBody(
+      origin,
+      parents,
+      position.body,
+      initializer === undefined,
+    );
+  if (
+    !repeating &&
+    position !== null &&
+    (binding.initializers.length > 1 || projectedInitializer) &&
+    binding.referenceInitializers.length === 0
+  ) {
+    const indexed = readFromTimeline(binding, position, read, parents);
+    if (indexed !== undefined) return indexed;
+  }
   // Coverage and latest-value selection are independent. A preceding write
   // can cover entry even when another write's order remains unknown.
   const hasDefiniteInitializer =
     position !== null &&
     binding.initializers.some((initializer) => {
-      const source = initializerPosition(initializer, parents);
+      const source = initializerInBody(initializer, parents, position?.body);
       return (
         source !== null &&
         positionPrecedes(source, position) &&
@@ -731,17 +1157,27 @@ const selectInitializers = (
   const origins = [
     ...binding.initializers.map((initializer) => ({
       initializer,
-      position: initializerPosition(initializer, parents),
+      position: initializerInBody(initializer, parents, position.body),
     })),
     ...binding.referenceInitializers.map((initializer) => ({
       initializer,
-      position: initializerPosition(initializer, parents, true),
+      position: initializerInBody(initializer, parents, position.body, true),
     })),
   ];
   const preceding: typeof origins = [];
   for (const origin of origins) {
     const source = origin.position;
-    if (source === null || source.body !== position.body) return undefined;
+    if (source === null || source.body !== position.body) {
+      if (
+        semanticTopLevelEffectFollowsCapture(
+          read,
+          origin.initializer.node,
+          parents,
+        )
+      )
+        continue;
+      return undefined;
+    }
     if (positionPrecedes(source, position)) preceding.push(origin);
     else if (!positionPrecedes(position, source)) {
       if (
@@ -749,6 +1185,15 @@ const selectInitializers = (
         source.declaratorIndex !== position.declaratorIndex
       )
         return undefined;
+      const parent = parents.get(origin.initializer.node);
+      if (
+        ((t.isAssignmentExpression(parent) &&
+          parent.right === origin.initializer.node) ||
+          (t.isVariableDeclarator(parent) &&
+            parent.init === origin.initializer.node)) &&
+        readInsideInitializer(read, origin.initializer.node, parents)
+      )
+        continue;
       const order = expressionEvaluationOrder(
         origin.initializer.node,
         read,
@@ -785,6 +1230,42 @@ const selectInitializers = (
       ),
     },
   };
+};
+
+/** An assignment installs its value only after its RHS has evaluated. */
+const readInsideInitializer = (
+  read: t.Node,
+  initializer: t.Node,
+  parents: WeakMap<t.Node, t.Node>,
+): boolean => {
+  const owner = initializerPositionCache(parents);
+  if (owner.initializerReads?.initializer !== initializer)
+    owner.initializerReads = { initializer, reads: new WeakMap() };
+  const cache = owner.initializerReads.reads;
+  const path: t.Node[] = [];
+  let current: t.Node | undefined = read;
+  let result = false;
+  while (current !== undefined) {
+    if (current === initializer) {
+      result = true;
+      break;
+    }
+    const cached = cache.get(current);
+    if (cached !== undefined) {
+      result = cached;
+      break;
+    }
+    path.push(current);
+    const parent = parents.get(current);
+    if (
+      t.isFunction(parent) ||
+      (parent !== undefined && delayedInstanceFieldValue(parent, current))
+    )
+      break;
+    current = parent;
+  }
+  for (const node of path) cache.set(node, result);
+  return result;
 };
 
 /** Logical writes may keep prior aliases. An RHS fact alone does not prove an

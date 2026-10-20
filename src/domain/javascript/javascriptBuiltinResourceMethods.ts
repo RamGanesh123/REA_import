@@ -3,7 +3,7 @@ export const BUILTIN_RESOURCE_METHODS = {
   fs: ["open", "openSync", "createReadStream", "createWriteStream"],
   "fs/promises": ["open"],
   net: ["connect", "createConnection"],
-  tls: ["connect", "createConnection"],
+  tls: ["connect"],
 } as const;
 
 export const BUILTIN_RESOURCE_SPECIFIERS = Object.keys(
