@@ -30,6 +30,10 @@ import {
   type ProcessStartTimeReader,
   verifyOwnedInferiorsEnded,
 } from "../process/ownedDebuggerSession.js";
+import {
+  verifyInferiorInputSink,
+  type InferiorInputSink,
+} from "../process/inferiorInputSink.js";
 import { parseLinuxProcessStat } from "../process/LinuxProcessStat.js";
 
 const STARTUP_TIMEOUT_MS = 10_000;
@@ -381,7 +385,7 @@ const verifyGdbInferiorOutputSink = async (
   pid: string,
   selectedTty: string,
   rememberIdentity: (identity: OwnedInferiorIdentity) => void,
-): Promise<void> => {
+): Promise<InferiorInputSink> => {
   if (process.platform !== "linux")
     throw new Error(
       "GDB cannot confirm live inferior output descriptors outside Linux /proc.",
@@ -418,7 +422,15 @@ const verifyGdbInferiorOutputSink = async (
     throw new Error(
       "The GDB inferior identity changed during descriptor readback.",
     );
+  // Preserve the proven identity even if fd 0 cannot be classified. A later
+  // retry can then confirm that the inferior ended after GDB exits.
   rememberIdentity({ pid, startTime: before });
+  const inputSink = await verifyInferiorInputSink(pid, {
+    path: ttyPath,
+    dev: tty.dev,
+    ino: tty.ino,
+  });
+  return inputSink;
 };
 
 class GdbCommandProcessExitError extends Error {
@@ -504,7 +516,7 @@ export class GdbSessionManager {
     pid: string,
     selectedTty: string,
     rememberIdentity: (identity: OwnedInferiorIdentity) => void,
-  ) => Promise<void>;
+  ) => Promise<InferiorInputSink>;
   readonly #readInferiorProcessStartTime: ProcessStartTimeReader | undefined;
   readonly #maxSessions: number;
   readonly #maxCommandOutputBytes: number;
@@ -525,7 +537,7 @@ export class GdbSessionManager {
         pid: string,
         selectedTty: string,
         rememberIdentity: (identity: OwnedInferiorIdentity) => void,
-      ) => Promise<void>;
+      ) => Promise<InferiorInputSink>;
       /** @internal Read-only process identity observer for lifecycle tests. */
       readonly readInferiorProcessStartTime?: ProcessStartTimeReader;
       readonly maxSessions?: number;
@@ -677,10 +689,34 @@ export class GdbSessionManager {
     >
   > {
     let launched: SpawnedOwnedProviderProcess;
+    const callerRunId = Object.hasOwn(this.#environment, "REA_PROCESS_RUN_ID")
+      ? this.#environment.REA_PROCESS_RUN_ID
+      : undefined;
+    if (callerRunId !== undefined && /[\r\n]/u.test(callerRunId)) {
+      releaseReservation();
+      return err(
+        new AnalysisCapabilityUnavailableError(
+          "gdb",
+          "start_gdb_session",
+          "The caller's REA_PROCESS_RUN_ID contains a line break and cannot be preserved for the inferior.",
+        ),
+      );
+    }
     try {
       const spawnOptions: OwnedProviderProcessSpawnOptions = {
         command: this.#command,
-        arguments: ["--nx", "--quiet", `--interpreter=${miVersion}`],
+        arguments: [
+          "--nx",
+          "--quiet",
+          `--interpreter=${miVersion}`,
+          // GDB inherits REA's ownership token; the inferior must see the
+          // caller's value (or none) so a later sweep cannot mistake it for an
+          // owned process. Applied before any inferior exists, so no MI request.
+          "-iex",
+          callerRunId === undefined
+            ? "unset environment REA_PROCESS_RUN_ID"
+            : `set environment REA_PROCESS_RUN_ID ${callerRunId}`,
+        ],
         runId: randomUUID(),
         stdin: "pipe",
         hostEnvironment: this.#environment,
@@ -1779,7 +1815,7 @@ export class GdbSessionManager {
       throw new Error(
         "GDB no longer reports the caller-selected inferior TTY; detachment cannot be confirmed safely.",
       );
-    await this.#verifyInferiorOutputSink(
+    const inputSink = await this.#verifyInferiorOutputSink(
       inferiorPids[0]!,
       session.inferiorTty!,
       (identity) =>
@@ -1788,6 +1824,10 @@ export class GdbSessionManager {
           identity,
         ),
     );
+    if (inputSink !== "durable" && inputSink !== "not-inherited")
+      throw new Error(
+        "GDB inferior descriptor readback did not confirm an independent input sink.",
+      );
     const detached = await this.#request(session, "-target-detach");
     if (
       detached.completion_status !== "complete" ||
@@ -1796,7 +1836,11 @@ export class GdbSessionManager {
     )
       throw new Error("GDB did not confirm inferior detachment.");
     session.knownInferiorIdentities.clear();
-    return { status: "detached", outputSink: "durable" };
+    return {
+      status: "detached",
+      outputSink: "durable",
+      inputSink,
+    };
   }
 
   async #settleExitedCommands(
