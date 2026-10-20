@@ -276,6 +276,7 @@ describe("web capture dimension uncertainty", () => {
     markSectionsComplete(captured.value, ["scripts"]);
     const after = structuredClone(captured.value);
     after.scripts.items = [];
+    after.scripts.total = 0;
     const request = after.network.requests[0];
     if (request !== undefined) {
       request.status = 204;
@@ -994,6 +995,7 @@ describe("web capture diff incomplete inventories", () => {
         changes: [],
       });
       markSectionsComplete(incomplete, ["scripts"]);
+      incomplete.scripts.total = 0;
       expect(compare(complete, incomplete).changes).toEqual([
         expect.objectContaining({ change: "removed" }),
       ]);
