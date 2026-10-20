@@ -55,6 +55,11 @@ const report: Il2cppMetadata = {
     },
   ],
   methods: [{ name: "Run", declaring_type: 0 }],
+  fields: [{ name: "value", declaring_type: 0 }],
+  properties: [],
+  events: [],
+  parameters: [{ name: "times", method: 0 }],
+  string_literals: [{ value: "Go", value_base64: null }],
   limitations: [],
 };
 
@@ -81,7 +86,18 @@ it("validates a sealed parent once across pages and keeps counts exact", () => {
     if (!view.ok) throw view.error;
     expect(view.value).toMatchObject({
       items: [{ index: offset, ...report.types[offset] }],
-      counts: { images: 1, types: 2, methods: 1, nested_types: 1 },
+      counts: {
+        sections: report.sections.length,
+        images: 1,
+        types: 2,
+        methods: 1,
+        nested_types: 1,
+        fields: 1,
+        properties: 0,
+        events: 0,
+        parameters: 1,
+        string_literals: 1,
+      },
     });
   }
   expect(parse).toHaveBeenCalledTimes(1);

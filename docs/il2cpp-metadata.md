@@ -7,7 +7,8 @@ with the header sections and serialized index widths. It reads the file without
 running it and requires no Unity installation, IL2CPP binary, active target,
 Hopper, Ghidra or IDA.
 
-Metadata versions 29, 31 and 39 are supported. For example, Unity 2022.3.30f1
+Metadata versions 24, 27, 29, 31 and 39 are supported. For example, Unity 2019.4.41f2
+wrote version 24, 2020.3.49f1 version 27, 2022.3.30f1
 wrote version 29, 2022.3.62f3 wrote 31 and 6000.4.2f1 wrote 39; other Unity
 releases that write these numbers have not been checked. Other versions are
 rejected as unsupported. The path must name a regular file; directories and
@@ -48,10 +49,12 @@ the original rows without reopening or decoding the file:
 }
 ```
 
-Collections are `sections`, `images`, `types` and `methods`. Every returned row
-includes its source `index`, scoped by artifact SHA-256 and collection. All
-collections accept batch `indices`, exact `names` and `fields`. Types also accept
-`image_indices`, `namespaces` and `declaring_types`; methods accept
+Collections are `sections`, `images`, `types`, `methods`, `fields`,
+`properties`, `events`, `parameters` and `string_literals`. Every returned row includes
+its source `index`, scoped by artifact SHA-256 and collection. All collections
+accept batch `indices` and `fields`; collections whose rows have a `name` also
+accept exact `names`. Types also accept `image_indices`, `namespaces` and
+`declaring_types`; methods, fields, properties and events accept
 `declaring_types`. Filters intersect, duplicate indices are returned once, and
 rows retain metadata order. An empty filter selects no rows; `fields: []`
 returns indices only. Omitted fields return the complete selected rows.
@@ -110,19 +113,24 @@ The result contains:
 
 - `artifact`: path, SHA-256 and byte length;
 - `magic`: unsigned little-endian header signature (`0xFAB11BAF`, delivered as a JSON number);
-- `metadata_version`: `29`, `31` or `39`;
+- `metadata_version`: `24`, `27`, `29`, `31` or `39`;
 - `index_widths`: the serialized widths (1, 2 or 4 bytes) of
   `type_definition`, `generic_container`, `parameter` and `type` indices, and
   `type_width_source`. Version 39 derives the type index width from the
-  `interface-offsets-record` or the `type-definition-record`; versions 29 and
-  31 always use 4-byte indices (`fixed-width-version`);
+  `interface-offsets-record` or the `type-definition-record`; versions 27, 29
+  and 31 always use 4-byte indices (`fixed-width-version`);
 - `sections`: all 31 header sections in header order, each with `offset`, `size`
-  and `count`. Versions 29 and 31 record no counts, so `count` is `null` and
+  and `count`. Versions 24 to 31 record no counts, so `count` is `null` and
   record counts come from the section sizes;
 - `images`: `name`, `type_start` and `type_count`;
 - `types`: `name`, `namespace`, `method_start`, `method_count`,
   `nested_type_start`, `nested_type_count` and `declaring_type`;
 - `methods`: `name` and `declaring_type`;
+- `fields`, `properties` and `events`: `name` and `declaring_type`, the type
+  whose member range holds the row (`-1` when none does);
+- `parameters`: `name` and `method`, the method whose parameter range holds it;
+- `string_literals`: managed string literals as `value`, or `value_base64` with
+  the exact bytes when they are not valid UTF-8;
 - `limitations`.
 
 A row's position in its collection is its metadata index, so `type_start`,
@@ -141,7 +149,7 @@ unneeded rows out of agent context without discarding the source Evidence.
 
 A file whose magic is not `0xFAB11BAF` fails as an unsupported target with
 `unrecognized-magic`. The file may be encrypted or may not be IL2CPP metadata.
-A version other than 29, 31 or 39 fails as an unsupported target with
+A version other than 24, 27, 29, 31 or 39 fails as an unsupported target with
 `unsupported-version`.
 
 Damaged metadata returns an input error (`invalid_format`) whose
@@ -150,7 +158,7 @@ message names one reason:
 | Reason                    | Meaning                                                                                                          |
 | ------------------------- | ---------------------------------------------------------------------------------------------------------------- |
 | `truncated-header`        | The file is shorter than the header.                                                                             |
-| `unexpected-header-size`  | `stringLiterals.offset` is not the header size: 256 bytes for versions 29 and 31, 380 for 39.                    |
+| `unexpected-header-size`  | `stringLiterals.offset` is not the header size: 264 bytes for version 24, 256 for 27, 29 and 31, 380 for 39.     |
 | `section-out-of-bounds`   | A section extends beyond the file, or a non-empty section starts inside the header.                              |
 | `section-overlap`         | Two sections overlap. Zero-size sections are exempt and gaps are allowed.                                        |
 | `record-size-mismatch`    | A section size does not divide into its records, or the record size differs from the one the index widths imply. |
@@ -184,12 +192,9 @@ report limit can still require the summary and paging path.
 ## Outside this tool
 
 - Decrypting or deobfuscating protected metadata.
-- Linking metadata to the native binary (`GameAssembly`, `UnityFramework`),
-  including method RVAs and code addresses.
-- Fields, properties, signatures, parameters and generic instances.
-- Ghidra or other disassembler integration. Use the
+- Native code addresses, member types and method signatures; use the
   [native workflow](native-investigation.md) for native code.
-- Metadata versions other than 29, 31 and 39.
+- Metadata versions other than 24, 27, 29, 31 and 39.
 
 Names come from the metadata file only. They do not establish which methods
 were compiled into the native binary or how they behave at runtime.

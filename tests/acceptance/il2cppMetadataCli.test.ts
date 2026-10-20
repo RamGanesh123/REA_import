@@ -88,6 +88,11 @@ cliTest(
       types: 4,
       methods: 5,
       nested_types: 1,
+      fields: 2,
+      properties: 0,
+      events: 0,
+      parameters: 1,
+      string_literals: 2,
     });
     expect(view.summary).not.toHaveProperty("sections");
     expect(view.summary.index_widths).toEqual(report.index_widths);
@@ -136,7 +141,7 @@ cliTest(
     const { client, call } = await connectLocalToolsMcp();
     const fixture = createIl2cppMetadataFixture();
     const unsupported = Buffer.from(fixture.bytes);
-    unsupported.writeInt32LE(27, 4);
+    unsupported.writeInt32LE(26, 4);
     const corrupt = Buffer.from(fixture.bytes);
     corrupt.writeInt32LE(
       fixture.section("typeDefinitions").offset + 4,
@@ -144,7 +149,7 @@ cliTest(
     );
     for (const [name, bytes, expected] of [
       [
-        "v27.dat",
+        "v26.dat",
         unsupported,
         {
           code: "unsupported_target",
@@ -210,7 +215,7 @@ it("queries compact retained metadata through the real SDK with exact row identi
   const overview = il2cppMetadataSummaryViewResultSchema.parse(
     parseEvidence(response.structuredContent).normalized_result,
   );
-  expect(overview.summary.counts).toEqual({
+  expect(overview.summary.counts).toMatchObject({
     sections: 31,
     images: 2,
     types: 4,

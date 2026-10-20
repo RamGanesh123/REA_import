@@ -17,6 +17,7 @@ import type { ExecutionOptions } from "../application/AnalysisProvider.js";
 import type { Il2cppMetadataPort } from "../application/il2cpp/Il2cppMetadataPort.js";
 import { AnalysisError } from "../domain/analysisErrorBase.js";
 import { createEvidence } from "../domain/evidence.js";
+import { jsonStringByteLength } from "../domain/jsonStringByteLength.js";
 import { jsonValueByteLength } from "../domain/jsonValueByteLength.js";
 import {
   AnalysisAccessDeniedError,
@@ -38,6 +39,7 @@ import { err, ok, type Result } from "../domain/result.js";
 import {
   Il2cppMetadataFormatFailure,
   readIl2cppMetadataSteps,
+  type Il2cppMetadataDecoded,
   type Il2cppMetadataRowCounts,
 } from "./Il2cppMetadataFile.js";
 
@@ -69,6 +71,60 @@ const TYPE_ROW = rowOverhead({
   declaring_type: 0,
 });
 const METHOD_ROW = rowOverhead({ name: "", declaring_type: 0 });
+const MEMBER_ROW = METHOD_ROW;
+const PARAMETER_ROW = rowOverhead({ name: "", method: 0 });
+// Literals carry `null` for the unused form instead of a string.
+const LITERAL_ROW =
+  JSON.stringify({ value: null, value_base64: null }).length - 4;
+
+/**
+ * A lower bound on the serialized rows. Rows share decoded names, so the
+ * report can be far larger than the file; refusing from this bound avoids
+ * building a string the budget would reject anyway. Once the bound passes
+ * `limit` it returns early, so no single name is escaped past the budget.
+ */
+const serializedRowsLowerBound = (
+  decoded: Il2cppMetadataDecoded,
+  limit: number,
+) => {
+  const lengths = new Map<string, number>();
+  let total = 0;
+  const text = (value: string) => {
+    let length = lengths.get(value);
+    if (length === undefined) {
+      // UTF-8 bytes, the unit the final report budget is checked in.
+      length = jsonStringByteLength(value, limit - total);
+      lengths.set(value, length);
+    }
+    return length;
+  };
+  for (const image of decoded.images) {
+    total += IMAGE_ROW + text(image.name);
+    if (total > limit) return total;
+  }
+  for (const type of decoded.types) {
+    total += TYPE_ROW + text(type.name) + text(type.namespace);
+    if (total > limit) return total;
+  }
+  for (const method of decoded.methods) {
+    total += METHOD_ROW + text(method.name);
+    if (total > limit) return total;
+  }
+  for (const members of [decoded.fields, decoded.properties, decoded.events])
+    for (const member of members) {
+      total += MEMBER_ROW + text(member.name);
+      if (total > limit) return total;
+    }
+  for (const parameter of decoded.parameters) {
+    total += PARAMETER_ROW + text(parameter.name);
+    if (total > limit) return total;
+  }
+  for (const literal of decoded.string_literals) {
+    total += LITERAL_ROW + text(literal.value ?? literal.value_base64 ?? "");
+    if (total > limit) return total;
+  }
+  return total;
+};
 
 const failureForPrimary = (cause: unknown, path: string): AnalysisError => {
   if (cause instanceof AnalysisError) return cause;
@@ -315,13 +371,15 @@ export class Il2cppMetadataProvider implements Il2cppMetadataPort {
           step = steps.next();
         }
         const decoded = step.value;
+        if (serializedRowsLowerBound(decoded, limit) > limit)
+          throw reportLimit(input.path, limit);
         const report = {
           ...decoded,
           artifact,
           limitations: [
-            "Only unencrypted global-metadata.dat versions 29, 31 and 39 are decoded; image, type and method names and counts are observed file content, not runtime behavior.",
-            "Native code addresses, IL2CPP binary registration, fields, properties, signatures and generic instances are not recovered.",
-            "declaring_type for types is derived from the nestedTypes section; row positions are the metadata TypeDefinitionIndex and MethodIndex values.",
+            "Only unencrypted global-metadata.dat versions 24, 27, 29, 31 and 39 are decoded; names, counts and string literals are observed file content, not runtime behavior.",
+            "Native code addresses, IL2CPP binary registration, member types, signatures and generic instances are not recovered.",
+            "declaring_type for types is derived from the nestedTypes section, and member and parameter owners from the owners' index ranges; row positions are the metadata indices.",
           ],
         };
         if (jsonValueByteLength(report, limit) > limit)
