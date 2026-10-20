@@ -32,7 +32,10 @@ import {
   rawBinarySelectionError,
 } from "../domain/rawBinary.js";
 import type { BinaryArchitecture } from "../domain/binaryTargetTypes.js";
-import { observeMzWindowsHeader } from "../domain/dosMz.js";
+import {
+  minimumWindowsHeaderOffset,
+  observeMzWindowsHeader,
+} from "../domain/dosMz.js";
 import {
   createXmlPlistSignatureProbe,
   hasBinaryPlistSignature,
@@ -494,7 +497,10 @@ const readExecutableMetadata = async (
       windowsHeader = observeMzWindowsHeader(bytes, fileSize, signatureBytes);
     }
     if (windowsHeader.state === "declared") {
-      if (windowsHeader.offset < 64)
+      if (
+        windowsHeader.offset <
+        minimumWindowsHeaderOffset(windowsHeader.signature)
+      )
         return err("invalid Windows new-header offset in MZ image");
       return readPeMetadata(
         handle,

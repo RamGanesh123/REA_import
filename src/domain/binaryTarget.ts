@@ -10,7 +10,11 @@ import type {
 } from "./binaryTargetTypes.js";
 import { err, ok, type Result } from "./result.js";
 import { readElfFixedHeader } from "./elfFixedHeader.js";
-import { observeMzWindowsHeader, parseDosMzHeader } from "./dosMz.js";
+import {
+  minimumWindowsHeaderOffset,
+  observeMzWindowsHeader,
+  parseDosMzHeader,
+} from "./dosMz.js";
 import {
   decodePeMachine,
   peOptionalHeaderMagic,
@@ -284,7 +288,10 @@ const parseMz = (
     );
   if (windowsHeader.state === "declared") {
     const { offset } = windowsHeader;
-    if (offset < 64 || offset > bytes.length - 24)
+    if (
+      offset < minimumWindowsHeaderOffset(windowsHeader.signature) ||
+      offset > bytes.length - 24
+    )
       return err("invalid or truncated Windows executable header in MZ image");
     if (["NE", "LE", "LX"].includes(windowsHeader.signature))
       return err(

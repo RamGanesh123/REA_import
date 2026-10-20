@@ -3,7 +3,25 @@ import { describe, expect, it } from "vitest";
 import { parseExecutableHeader } from "./binaryTarget.js";
 import { dosMz, elf, fat, pe, thinMach } from "./binaryTarget.fixture.js";
 
+const TINY_PE_97 = Buffer.from(
+  "TVoAAFBFAABMAQEAaipYwwAAAAAAAAAABAADAQsBCAAEAAAAAAAAAAQAAAAMAAAABAAAAAwAAAAAAEAABAAAAAQAAAAEAAAAAAAAAAQAAAAAAAAAaAAAAGQAAAAAAAAAAg==",
+  "base64",
+);
+
 describe("executable header parsing", () => {
+  it("no longer refuses an overlapped-header PE as an invalid offset", () => {
+    const result = parseExecutableHeader(TINY_PE_97, "x64", TINY_PE_97.length);
+    expect(result).toEqual({
+      ok: false,
+      error: "truncated PE optional header",
+    });
+  });
+
+  it("still rejects a low e_lfanew when no PE signature is there", () => {
+    const bytes = Buffer.from(TINY_PE_97);
+    bytes.write("XXXX", 4, "latin1");
+    expect(parseExecutableHeader(bytes, "x64", bytes.length).ok).toBe(false);
+  });
   it("recognizes a DOS MZ without interpreting load-module bytes as e_lfanew", () => {
     expect(parseExecutableHeader(dosMz(), "x64")).toEqual({
       ok: true,

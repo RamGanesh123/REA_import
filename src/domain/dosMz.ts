@@ -34,6 +34,14 @@ export type MzWindowsHeaderObservation =
     };
 
 /**
+ * Smallest file offset at which a Windows new header may start. A confirmed
+ * `PE\0\0` signature may overlap the DOS header (Sotirov's Tiny PE uses 4);
+ * other signatures keep the conventional 64-byte floor.
+ */
+export const minimumWindowsHeaderOffset = (signature: string): number =>
+  signature === "PE" ? 4 : 64;
+
+/**
  * Observe the Windows new-header pointer without mistaking short DOS module
  * bytes for e_lfanew. Complete DOS headers declare their pointer; for shorter
  * headers, only a PE/NE/LE/LX signature at that pointer confirms the candidate.
