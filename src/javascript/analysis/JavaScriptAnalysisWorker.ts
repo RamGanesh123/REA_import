@@ -16,6 +16,7 @@ import type {
   JavaScriptSourceAnalysisFailure,
   JavaScriptSourceAnalysisLimits,
 } from "../../domain/javascript/javascriptSourceAnalysis.js";
+import { JAVASCRIPT_PARENT_RESULT_BUDGET_REMEDIATION } from "../../domain/javascript/javascriptAnalysisResourceControls.js";
 import { AnalysisError } from "../../domain/analysisErrorBase.js";
 import {
   AnalysisCancelledError,
@@ -257,6 +258,9 @@ export class JavaScriptAnalysisWorker {
                 parent_result_budget_bytes: this.#resultBudgetBytes,
                 parent_result_budget_exhausted: true,
               },
+              {
+                remediationAction: `Use the retained static facts or analyze fewer source files. ${JAVASCRIPT_PARENT_RESULT_BUDGET_REMEDIATION}`,
+              },
             );
           offeredResultBudget =
             this.#applicationProjectionFailure !== undefined &&
@@ -336,8 +340,7 @@ export class JavaScriptAnalysisWorker {
                 module_retention_estimate_bytes: moduleEstimate,
               },
               {
-                remediationAction:
-                  "Use the retained static facts or analyze fewer source files. This limit belongs to the parent result budget; increasing the worker heap alone does not increase it.",
+                remediationAction: `Use the retained static facts or analyze fewer source files. ${JAVASCRIPT_PARENT_RESULT_BUDGET_REMEDIATION}`,
               },
             ),
           });
@@ -376,8 +379,7 @@ export class JavaScriptAnalysisWorker {
                   graph_records: descriptor.graph_records,
                 },
                 {
-                  remediationAction:
-                    "Use the retained static and module facts or analyze fewer source files. This limit belongs to the parent result budget; increasing the worker heap alone does not increase it.",
+                  remediationAction: `Use the retained static and module facts or analyze fewer source files. ${JAVASCRIPT_PARENT_RESULT_BUDGET_REMEDIATION}`,
                 },
               ),
             });

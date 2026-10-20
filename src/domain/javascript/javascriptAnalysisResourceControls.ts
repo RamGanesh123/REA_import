@@ -15,6 +15,16 @@ export const JAVASCRIPT_ANALYSIS_RESOURCE_DEFAULTS = {
 /** Maximum caller-selected retained record capacity; heap and transfer admission still apply. */
 export const JAVASCRIPT_SEMANTIC_ITEM_MAXIMUM = 1_000_000;
 
+/**
+ * Remediation clause for an exhausted parent result budget. Every producer that
+ * reports `parent_result_budget_exhausted` states this clause, and so does the
+ * presentation fallback that answers a producer stating nothing, so the
+ * sentence has one owner. What was actually retained differs per producer and
+ * stays in that producer's own leading sentence.
+ */
+export const JAVASCRIPT_PARENT_RESULT_BUDGET_REMEDIATION =
+  "This limit belongs to the parent result budget; increasing the worker heap alone does not increase it.";
+
 /** Project observed execution limits without inventing unmeasured values. */
 export const javaScriptAnalysisCoverageLimits = (
   limits: Readonly<Record<string, JsonValue>> | null,

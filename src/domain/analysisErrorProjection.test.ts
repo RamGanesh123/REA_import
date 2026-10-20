@@ -272,6 +272,67 @@ it.each([
     );
   },
 );
+
+it("advises the parent result budget when it is exhausted", () => {
+  const projected = projectAnalysisError(
+    new AnalysisResourceConstraintError(
+      "analyze_javascript_application",
+      "memory",
+      "The parent's result capacity was exhausted after retaining static facts for app.asar/main.js; remaining sources were not analyzed",
+      {
+        worker_old_space_mb: 1024,
+        parent_result_budget_bytes: 961153232,
+        parent_result_budget_exhausted: true,
+      },
+    ),
+  );
+  expect(projected.remediation.action).toContain("parent result budget");
+  expect(projected.remediation.action).toContain("worker heap");
+  expect(projected.remediation.action).not.toContain("sufficient memory");
+  expect(analysisErrorProjectionSchema.safeParse(projected).success).toBe(true);
+});
+
+it("keeps an explicit remediation when the parent budget is exhausted", () => {
+  const projected = projectAnalysisError(
+    new AnalysisResourceConstraintError(
+      "analyze_javascript_application",
+      "memory",
+      "The parent's result capacity was exhausted",
+      { parent_result_budget_exhausted: true },
+      { remediationAction: "Analyze fewer source files." },
+    ),
+  );
+  expect(projected.remediation.action).toBe("Analyze fewer source files.");
+});
+
+it("keeps the worker memory advice without parent exhaustion", () => {
+  const projected = projectAnalysisError(
+    new AnalysisResourceConstraintError(
+      "analyze_javascript_application",
+      "memory",
+      "Owned JavaScript worker reached its process memory limit",
+      { worker_old_space_mb: 1024 },
+    ),
+  );
+  expect(projected.remediation.action).toContain("sufficient memory");
+});
+
+it("keeps a constraint's own advice when another resource reports the flag", () => {
+  const projected = projectAnalysisError(
+    new AnalysisResourceConstraintError(
+      "analyze_javascript_application",
+      "cpu",
+      "Owned JavaScript worker exhausted its CPU budget",
+      { parent_result_budget_exhausted: true },
+    ),
+  );
+  // The parent budget clause names the worker heap, so it answers a memory
+  // constraint; a constraint of another kind keeps the advice for its own
+  // resource rather than being told about a limit that clause does not describe.
+  expect(projected.remediation.action).toContain("worker CPU limits");
+  expect(projected.remediation.action).not.toContain("parent result budget");
+});
+
 it.each([
   new AnalysisInputError("inspect", { capturedOutput: retainedOutput }),
   new AnalysisOutputError("inspect", "invalid reply", {
