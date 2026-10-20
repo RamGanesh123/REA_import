@@ -96,6 +96,7 @@ export const createEnvironmentMcpServer = (
       {
         description: definition.description,
         inputSchema: fromJsonSchema<ReplayArguments>(definition.inputSchema),
+        annotations: definition.annotations,
       },
       (args): CallToolResult => {
         const replayed = replayEnvironmentTool(source, definition.tool, args);
@@ -226,11 +227,7 @@ export const serveEnvironment = async (
 ): Promise<Result<ServedEnvironment, AnalysisResourceConstraintError>> => {
   const { source, host, port, logger } = options;
   const name = options.environmentName ?? source.manifest.name;
-  const prepared = environmentToolDefinitions(
-    source.manifest,
-    source.evidenceId,
-    name,
-  );
+  const prepared = environmentToolDefinitions(source, name);
   if (!prepared.ok) return prepared;
   const tools = prepared.value;
   const card = environmentCard(name, tools);

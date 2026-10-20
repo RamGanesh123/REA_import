@@ -47,17 +47,18 @@ it("charges environment identity, aggregate tools and escaped text before produc
     query_parameter_names: [],
   }));
   expect(
-    environmentToolDefinitions({ ...source.manifest, tools }, source.evidenceId)
-      .ok,
+    environmentToolDefinitions({
+      ...source,
+      manifest: { ...source.manifest, tools },
+    }).ok,
   ).toBe(false);
   expect(
     environmentToolDefinitions(
-      source.manifest,
-      source.evidenceId,
+      source,
       "x".repeat(ENVIRONMENT_CATALOG_LIMIT_BYTES),
     ).ok,
   ).toBe(false);
-  const normal = environmentToolDefinitions(source.manifest, source.evidenceId);
+  const normal = environmentToolDefinitions(source);
   expect(normal.ok).toBe(true);
   if (!normal.ok) throw normal.error;
   expect(

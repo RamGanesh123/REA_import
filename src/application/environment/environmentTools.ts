@@ -1,9 +1,20 @@
+import {
+  isObject,
+  isQueryPost,
+  listItems,
+  locateList,
+  pointerTokens,
+  type JsonObject,
+} from "../../domain/analysisView/environmentStateRules.js";
 import { AnalysisResourceConstraintError } from "../../domain/analysisErrorCore.js";
+import type { JsonValue } from "../../domain/jsonValue.js";
 import { err, ok, type Result } from "../../domain/result.js";
-import { ENVIRONMENT_SERVE_OPERATION } from "./environmentSource.js";
-import type {
-  EnvironmentManifest,
-  EnvironmentManifestTool,
+import {
+  ENVIRONMENT_SERVE_OPERATION,
+  replayedBody,
+  type EnvironmentManifestTool,
+  type EnvironmentSource,
+  type RecordedExchange,
 } from "./environmentSource.js";
 
 /** Methods whose tools accept an optional request body object. */
@@ -27,19 +38,51 @@ export interface EnvironmentToolInputSchema {
   readonly additionalProperties: false;
 }
 
-/** One manifest tool as an MCP tool: name, description and input schema. */
+/** MCP hints for the captured method; answers come from the capture, never the open world. */
+export interface EnvironmentToolAnnotations {
+  readonly readOnlyHint: boolean;
+  /** Set for `DELETE` only; other writes leave the MCP default (destructive). */
+  readonly destructiveHint?: true;
+  readonly idempotentHint: boolean;
+  readonly openWorldHint: false;
+}
+
+/** One manifest tool as an MCP tool: name, description, input schema and the hints MCP advertises; the card omits the hints. */
 export interface EnvironmentToolDefinition {
   readonly name: string;
   readonly description: string;
   readonly inputSchema: EnvironmentToolInputSchema;
+  readonly annotations: EnvironmentToolAnnotations;
   readonly tool: EnvironmentManifestTool;
 }
+
+const IDEMPOTENT_METHODS: ReadonlySet<string> = new Set([
+  "GET",
+  "HEAD",
+  "PUT",
+  "DELETE",
+]);
+
+const environmentToolAnnotations = ({
+  method,
+  path_template: path,
+}: EnvironmentManifestTool): EnvironmentToolAnnotations => ({
+  readOnlyHint:
+    method === "GET" || method === "HEAD" || isQueryPost(method, path),
+  ...(method === "DELETE" ? { destructiveHint: true as const } : {}),
+  idempotentHint: IDEMPOTENT_METHODS.has(method),
+  openWorldHint: false,
+});
 
 /** Agent-context budget for each captured display sample, excluding its provenance notice. */
 const DESCRIPTION_SAMPLE_BYTES = 1024;
 
-/** A display prefix is explicitly separate from the complete identity held by the manifest. */
-const describeText = (text: string, label: string): string => {
+/** A display prefix is explicitly separate from the complete identity held by the Evidence named. */
+const describeText = (
+  text: string,
+  label: string,
+  holder = "manifest Evidence",
+): string => {
   if (
     text.length <= DESCRIPTION_SAMPLE_BYTES &&
     Buffer.byteLength(text, "utf8") <= DESCRIPTION_SAMPLE_BYTES
@@ -49,14 +92,15 @@ const describeText = (text: string, label: string): string => {
     text,
     new Uint8Array(DESCRIPTION_SAMPLE_BYTES),
   );
-  return `${text.slice(0, read)}… (${label} display truncated; full value in manifest Evidence)`;
+  return `${text.slice(0, read)}… (${label} display truncated; full value in ${holder})`;
 };
 
-/** Sample whole values before joining; keep full lists in the manifest that owns them. */
+/** Sample whole values before joining; keep full lists in the Evidence that owns them. */
 const describeList = <Value>(
   values: Iterable<Value>,
   count: number,
   display: (value: Value) => string = String,
+  holder = "manifest Evidence",
 ): string => {
   if (count === 0) return "none";
   const sample: string[] = [];
@@ -76,7 +120,73 @@ const describeList = <Value>(
   const listed = sample.join(", ");
   return sample.length === count
     ? listed
-    : `${listed}${sample.length === 0 ? "" : ", "}… (${String(sample.length)}/${String(count)} shown; full list in manifest Evidence)`;
+    : `${listed}${sample.length === 0 ? "" : ", "}… (${String(sample.length)}/${String(count)} shown; full list in ${holder})`;
+};
+
+/** Field names of the objects in first-seen order; the recorded bodies stay in the capture Evidence. */
+const withFields = (objects: readonly JsonObject[]): string => {
+  const names = new Set<string>();
+  for (const object of objects)
+    for (const name of Object.keys(object)) names.add(name);
+  return names.size === 0
+    ? "with no fields"
+    : `with fields ${describeList(names, names.size, String, "capture Evidence")}`;
+};
+
+/** One level of a JSON body; a list is an array of objects found by the state's list rule. */
+const describeJson = (value: JsonValue): string => {
+  const pointer = locateList(value, undefined);
+  const items = pointer === undefined ? [] : (listItems(value, pointer) ?? []);
+  if (pointer !== undefined && items.length > 0) {
+    const [member] = pointerTokens(pointer);
+    return member === undefined
+      ? `a JSON array of objects ${withFields(items)}`
+      : `a JSON object whose ${describeText(member, "member", "capture Evidence")} lists objects ${withFields(items)}`;
+  }
+  if (isObject(value)) return `a JSON object ${withFields([value])}`;
+  if (Array.isArray(value)) return "a JSON array";
+  return `a JSON ${value === null ? "null" : typeof value}`;
+};
+
+const isSuccess = (status: number | null): boolean =>
+  status !== null && status >= 200 && status < 300;
+
+/** The first cited record replay answers as JSON, preferring a 2xx one; each body is parsed at most once. */
+const firstJson = (
+  tool: EnvironmentManifestTool,
+  exchanges: ReadonlyMap<number, RecordedExchange>,
+):
+  | { readonly status: number | null; readonly value: JsonValue }
+  | undefined => {
+  for (const success of [true, false])
+    for (const ordinal of tool.record_ordinals) {
+      const exchange = exchanges.get(ordinal);
+      if (exchange === undefined || isSuccess(exchange.status) !== success)
+        continue;
+      const body = replayedBody(exchange);
+      if (body.kind === "json")
+        return { status: exchange.status, value: body.value };
+    }
+  return undefined;
+};
+
+/** What the tool returns as JSON, labelled with the status unless it succeeded, then the manifest's recorded statuses. */
+const describeResponses = (
+  tool: EnvironmentManifestTool,
+  exchanges: ReadonlyMap<number, RecordedExchange>,
+): string => {
+  const recorded =
+    tool.statuses.length === 0
+      ? "no recorded status"
+      : `recorded statuses ${describeList(tool.statuses, tool.statuses.length)}`;
+  const found = firstJson(tool, exchanges);
+  if (found === undefined) return recorded;
+  const returns = isSuccess(found.status)
+    ? "returns"
+    : found.status === null
+      ? "a record without a status returns"
+      : `status ${String(found.status)} returns`;
+  return `${returns} ${describeJson(found.value)}; ${recorded}`;
 };
 
 /** Captured argument names longer than this are advertised under a short alias; the manifest keeps the name. */
@@ -199,9 +309,8 @@ const EMPTY_TOOL_BYTES = JSON.stringify({
 
 /** Admit complete discovery before binding; six bytes per UTF-16 unit covers JSON escaping and UTF-8 expansion. */
 export const environmentToolDefinitions = (
-  manifest: EnvironmentManifest,
-  evidenceId: string,
-  name: string = manifest.name,
+  source: EnvironmentSource,
+  name: string = source.manifest.name,
   operation: string = ENVIRONMENT_SERVE_OPERATION,
 ): Result<
   readonly EnvironmentToolDefinition[],
@@ -235,15 +344,22 @@ export const environmentToolDefinitions = (
   if (!text(name) || !reserve(JSON.stringify(environmentCard("", [])).length))
     return refused();
   const definitions: EnvironmentToolDefinition[] = [];
-  for (const tool of manifest.tools) {
-    if (!reserve(EMPTY_TOOL_BYTES) || !text(tool.name)) return refused();
+  for (const tool of source.manifest.tools) {
+    const annotations = environmentToolAnnotations(tool);
+    // Only MCP discovery carries the hints; charging them per tool over-charges the card harmlessly.
+    if (
+      !reserve(EMPTY_TOOL_BYTES + JSON.stringify({ annotations }).length) ||
+      !text(tool.name)
+    )
+      return refused();
     const count =
       tool.params.length +
       tool.query_parameter_names.length +
       (WRITE_METHODS.has(tool.method) ? 1 : 0);
     // A lower bound rejects enormous argument lists before constructing their alias map.
     if (!reserve(count * EMPTY_PROPERTY_BYTES)) return refused();
-    const description = `${REPLAY_CATALOG_INSTRUCTIONS} ${describeText(tool.method, "method")} ${describeText(tool.path_template, "path")}; replays retained records [${describeList(tool.record_ordinals, tool.record_ordinals.length)}]; evidence ${evidenceId}`;
+    // The response summary is bounded by its samples and charged with the whole description.
+    const description = `${REPLAY_CATALOG_INSTRUCTIONS} ${describeText(tool.method, "method")} ${describeText(tool.path_template, "path")}; ${describeResponses(tool, source.exchanges)}; replays retained records [${describeList(tool.record_ordinals, tool.record_ordinals.length)}]; evidence ${source.evidenceId}`;
     if (!text(description)) return refused();
     const args = environmentToolArguments(tool);
     const properties = new Map<string, EnvironmentToolProperty>();
@@ -270,6 +386,7 @@ export const environmentToolDefinitions = (
         required,
         additionalProperties: false,
       },
+      annotations,
       tool,
     });
   }

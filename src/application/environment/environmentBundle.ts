@@ -300,8 +300,7 @@ export const planEnvironmentBundle = (
     return err(nameError(name));
   if (WINDOWS_RESERVED_NAME.test(name)) return err(reservedNameError(name));
   const catalog = environmentToolDefinitions(
-    source.manifest,
-    source.evidenceId,
+    source,
     name,
     ENVIRONMENT_EXPORT_OPERATION,
   );
