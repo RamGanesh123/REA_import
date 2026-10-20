@@ -7,20 +7,24 @@ import {
 } from "@modelcontextprotocol/server";
 import type { Logger } from "pino";
 
-import {
-  replayEnvironmentTool,
-  type ReplayArguments,
-} from "../../application/environment/environmentReplay.js";
+import type { ReplayArguments } from "../../application/environment/environmentReplay.js";
 import type { EnvironmentSource } from "../../application/environment/environmentSource.js";
 import {
+  servedCatalog,
+  type EnvironmentState,
+} from "../../application/environment/environmentState.js";
+import {
+  environmentToolAnswer,
+  type EnvironmentToolAnswer,
+} from "../../application/environment/environmentStateAnswer.js";
+import { EnvironmentStateStore } from "../../application/environment/environmentStateStore.js";
+import {
   environmentCard,
-  environmentToolDefinitions,
   REPLAY_CATALOG_INSTRUCTIONS,
   type EnvironmentCard,
   type EnvironmentToolDefinition,
 } from "../../application/environment/environmentTools.js";
 import { projectAnalysisError } from "../../domain/analysisErrorProjection.js";
-import { isExactJsonNumber } from "../../domain/exactJsonNumber.js";
 import { safeParseJson } from "../../domain/safeJson.js";
 import type { AnalysisResourceConstraintError } from "../../domain/analysisErrorCore.js";
 import { ok, type Result } from "../../domain/result.js";
@@ -36,11 +40,22 @@ import {
   UNTRUSTED_CONTENT_INSTRUCTIONS,
 } from "../toolResultEncoding.js";
 import { RequestTrackingMcpServer } from "../RequestTrackingMcpServer.js";
+import {
+  stateDataPlane,
+  type RpcMethods,
+  type RpcOutcome,
+} from "./environmentDataPlane.js";
+import {
+  DEFAULT_STATE_INTAKE,
+  exactJsonReviver,
+  type RpcError,
+  type StateFetcher,
+} from "./stateIntake.js";
 import { TargetContentTransport } from "./targetContentTransport.js";
 
 /** Where the environment card is served. */
 export const ENVIRONMENT_CARD_PATH = "/.well-known/agent-env.json";
-/** The JSON-RPC data plane the card advertises; this increment answers every method as unknown. */
+/** The JSON-RPC data plane the card advertises; it serves methods only when serving from a state. */
 export const ENVIRONMENT_RPC_PATH = "/agentenv";
 
 const METHOD_NOT_FOUND = -32601;
@@ -76,11 +91,11 @@ const isRpcMessage = (
   (!("params" in message) ||
     (typeof message.params === "object" && message.params !== null));
 
-/** Build the MCP server whose tools replay retained records; every result is target content. */
+/** Build the MCP server whose tools answer from retained records or the live state; every result is target content. */
 export const createEnvironmentMcpServer = (
   name: string,
-  source: EnvironmentSource,
   tools: readonly EnvironmentToolDefinition[],
+  answer: EnvironmentToolAnswer,
 ): RequestTrackingMcpServer => {
   // Tool names, descriptions and replies all come from the captured application, so the
   // server carries REA's untrusted-content instructions plus a warning about its own catalog.
@@ -98,7 +113,7 @@ export const createEnvironmentMcpServer = (
         inputSchema: fromJsonSchema<ReplayArguments>(definition.inputSchema),
       },
       (args): CallToolResult => {
-        const replayed = replayEnvironmentTool(source, definition.tool, args);
+        const replayed = answer(definition.tool, args);
         if (!replayed.ok)
           return {
             isError: true,
@@ -119,14 +134,16 @@ export const createEnvironmentMcpServer = (
   return server;
 };
 
-interface RpcErrorReply {
+type RpcReply = {
   readonly jsonrpc: "2.0";
   readonly id: string | number | null;
-  readonly error: { readonly code: number; readonly message: string };
-}
+} & ({ readonly result: unknown } | { readonly error: RpcError });
 
-/** The reply to one JSON-RPC message: invalid request, method not found, or none for a notification. */
-const rpcReply = (message: unknown): RpcErrorReply | undefined => {
+/** The reply to one JSON-RPC message, or none for a notification; a method no table serves is not found. */
+const rpcReply = async (
+  message: unknown,
+  methods: RpcMethods | undefined,
+): Promise<RpcReply | undefined> => {
   const id =
     isRecord(message) &&
     (typeof message.id === "string" || typeof message.id === "number")
@@ -138,19 +155,25 @@ const rpcReply = (message: unknown): RpcErrorReply | undefined => {
       id,
       error: { code: INVALID_REQUEST, message: "invalid request" },
     };
+  const method = String(message.method);
+  // A notification still runs its method; it only gets no reply.
+  const outcome: RpcOutcome | undefined =
+    methods === undefined ? undefined : await methods(method, message.params);
   if (!("id" in message)) return undefined;
   return {
     jsonrpc: "2.0",
     id,
-    error: {
-      code: METHOD_NOT_FOUND,
-      message: `method not found: ${message.method}`,
-    },
+    ...(outcome ?? {
+      error: { code: METHOD_NOT_FOUND, message: `method not found: ${method}` },
+    }),
   };
 };
 
-/** Answer the data plane with a JSON-RPC method-not-found error for every request within the body bound. */
-const answerRpc = async (request: Request): Promise<Response> => {
+/** Answer the data plane within the body bound; without methods every request is not found. */
+const answerRpc = async (
+  request: Request,
+  methods: RpcMethods | undefined,
+): Promise<Response> => {
   const read = await readRequestBody(request, DEFAULT_MAX_REQUEST_BODY_SIZE);
   if (read.tooLarge)
     return jsonRpcErrorResponse(
@@ -158,13 +181,8 @@ const answerRpc = async (request: Request): Promise<Response> => {
       PAYLOAD_TOO_LARGE,
       `Request body must not exceed ${String(DEFAULT_MAX_REQUEST_BODY_SIZE)} bytes`,
     );
-  const parsed = safeParseJson(read.text, (key, value, context) =>
-    key === "id" &&
-    typeof value === "number" &&
-    !isExactJsonNumber(value, context?.source)
-      ? Symbol("unrepresentable RPC id")
-      : value,
-  );
+  // Values parsing would alter become markers: such an id is refused rather than echoed as another number, and a state document carrying one is refused.
+  const parsed = safeParseJson(read.text, exactJsonReviver);
   if (!parsed.ok) return jsonRpcErrorResponse(400, PARSE_ERROR, "parse error");
   // A batch is answered message by message; notifications get no reply at all.
   if (Array.isArray(parsed.value)) {
@@ -176,31 +194,40 @@ const answerRpc = async (request: Request): Promise<Response> => {
         INVALID_REQUEST,
         `batch exceeds ${String(MAX_RPC_BATCH_MESSAGES)} messages`,
       );
-    const replies = parsed.value
-      .map(rpcReply)
-      .filter((reply) => reply !== undefined);
+    // Messages run in order, so a batch's later reads see its earlier writes.
+    const replies: RpcReply[] = [];
+    for (const message of parsed.value) {
+      const reply = await rpcReply(message, methods);
+      if (reply !== undefined) replies.push(reply);
+    }
     return replies.length === 0
       ? new Response(null, { status: 202 })
       : Response.json(replies);
   }
-  const reply = rpcReply(parsed.value);
+  const reply = await rpcReply(parsed.value, methods);
   return reply === undefined
     ? new Response(null, { status: 202 })
     : Response.json(reply, {
-        status: reply.error.code === INVALID_REQUEST ? 400 : 200,
+        status:
+          "error" in reply && reply.error.code === INVALID_REQUEST ? 400 : 200,
       });
 };
 
-/** The plain routes an agent environment serves beside `/mcp`. */
+/** The plain routes an agent environment serves beside `/mcp`; data-plane methods only when given. */
 export const environmentRoutes = (
   card: EnvironmentCard,
+  methods?: RpcMethods,
 ): readonly StreamableHttpRoute[] => [
   {
     method: "GET",
     path: ENVIRONMENT_CARD_PATH,
     handle: () => Response.json(card),
   },
-  { method: "POST", path: ENVIRONMENT_RPC_PATH, handle: answerRpc },
+  {
+    method: "POST",
+    path: ENVIRONMENT_RPC_PATH,
+    handle: (request) => answerRpc(request, methods),
+  },
 ];
 
 export interface ServeEnvironmentOptions {
@@ -213,6 +240,10 @@ export interface ServeEnvironmentOptions {
   readonly logger?: Logger;
   /** Reports a listener failure after binding; the failure is logged either way. */
   readonly onerror?: (error: Error) => void;
+  /** The initial state read tools answer from; without it every tool replays its recordings. */
+  readonly state?: EnvironmentState;
+  /** Downloads https state documents for `data/add`; defaults to a redirect-refusing fetch. */
+  readonly fetchState?: StateFetcher;
 }
 
 /** A listening agent environment and the card it serves. */
@@ -226,20 +257,32 @@ export const serveEnvironment = async (
 ): Promise<Result<ServedEnvironment, AnalysisResourceConstraintError>> => {
   const { source, host, port, logger } = options;
   const name = options.environmentName ?? source.manifest.name;
-  const prepared = environmentToolDefinitions(
-    source.manifest,
-    source.evidenceId,
-    name,
-  );
-  if (!prepared.ok) return prepared;
-  const tools = prepared.value;
-  const card = environmentCard(name, tools);
+  // One store per process: every MCP session and the data plane share it.
+  const store =
+    options.state === undefined
+      ? undefined
+      : new EnvironmentStateStore(options.state);
+  const catalog = servedCatalog(source, store !== undefined, name);
+  if (!catalog.ok) return catalog;
+  const { tools, dataPlane } = catalog.value;
+  const card = environmentCard(name, tools, dataPlane);
+  const answer = environmentToolAnswer(source, store);
   const served = await serveStreamableHttp({
     host,
     port,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
-    createMcpServer: () => createEnvironmentMcpServer(name, source, tools),
-    routes: environmentRoutes(card),
+    createMcpServer: () => createEnvironmentMcpServer(name, tools, answer),
+    routes: environmentRoutes(
+      card,
+      store === undefined
+        ? undefined
+        : stateDataPlane(store, {
+            ...DEFAULT_STATE_INTAKE,
+            ...(options.fetchState === undefined
+              ? {}
+              : { fetchState: options.fetchState }),
+          }),
+    ),
     ...(logger === undefined ? {} : { logger }),
     onerror: (error) => {
       logger?.error(

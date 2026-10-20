@@ -3,6 +3,8 @@ import {
   analysisViewCaptureEvidence,
   environmentManifestCaptureFixture,
   environmentStateCaptureFixture,
+  timedCaptureEvidence,
+  type TimedCaptureRow,
 } from "../../../tests/fixtures/analysisView.js";
 import {
   SCENARIO_EXCHANGES,
@@ -48,35 +50,8 @@ const stateOf = (parent: AnalysisViewParent = parentOf()): State => {
   return result.value;
 };
 
-type Row = readonly [
-  method: string,
-  path: string,
-  body?: JsonValue,
-  status?: number,
-];
-
-/** HAR entries one second apart on one origin; a string body is recorded as written. */
-const captureOf = (rows: readonly Row[]): AnalysisViewParent =>
-  parentOf(
-    analysisViewCaptureEvidence(
-      environmentManifestCaptureFixture(
-        rows.map(([method, path, body = null, status = 200], index) => ({
-          startedDateTime: new Date(
-            Date.parse("2026-10-17T18:00:00.000Z") + index * 1000,
-          ).toISOString(),
-          time: 5,
-          request: { method, url: `http://app.example${path}` },
-          response: {
-            status,
-            content: {
-              mimeType: "application/json",
-              text: typeof body === "string" ? body : JSON.stringify(body),
-            },
-          },
-        })),
-      ),
-    ),
-  );
+const captureOf = (rows: readonly TimedCaptureRow[]): AnalysisViewParent =>
+  parentOf(timedCaptureEvidence(rows));
 
 const viewOf = (state: State, tool: string) =>
   state.views.find((view) => view.tool === tool);
@@ -278,7 +253,7 @@ it("does not list the whole collection when a counter exceeds the number listed"
 });
 
 it("lists the whole collection with its counter only when every recording did", () => {
-  const rows: Row[] = [
+  const rows: TimedCaptureRow[] = [
     [
       "GET",
       "/api/items",
