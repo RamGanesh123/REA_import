@@ -37,6 +37,7 @@ export const inspectKunaProvider = async (
   platform: NodeJS.Platform = process.platform,
   options: {
     readonly fileCloseResources: FileCloseResourceOwner;
+    readonly signal?: AbortSignal;
   },
 ): Promise<DoctorProviderInspection> => {
   let installation: Awaited<ReturnType<typeof inspectKunaInstallation>>;
@@ -44,6 +45,7 @@ export const inspectKunaProvider = async (
     installation = await inspectKunaInstallation(environment, {
       platform,
       fileCloseResources: options.fileCloseResources,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
     });
   } catch (cause: unknown) {
     if (!(cause instanceof RegularFileCleanupFailure)) throw cause;
