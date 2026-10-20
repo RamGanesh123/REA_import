@@ -128,8 +128,9 @@ export function* indexCommonJsExportReceiversSteps(
   const publicCallWrites = new WeakSet<t.Node>();
   // Consume the shared write owner's resolved aliases, intrinsic invocation
   // and keyed mutator facts instead of reinterpreting call names here.
-  for (const { node, path } of state.ambientWriteEffects) {
+  for (const { node, path, kind } of state.ambientReferenceEffects) {
     if (
+      kind === "write" &&
       (t.isCallExpression(node) || t.isOptionalCallExpression(node)) &&
       path[0] === "commonjs-module" &&
       path.length <= 2 &&

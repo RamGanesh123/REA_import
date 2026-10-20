@@ -403,9 +403,10 @@ export const semanticOriginalGlobalProcessAt = (
   let replacements = globalProcessReplacements.get(state);
   if (replacements === undefined) {
     replacements = [
-      ...state.ambientWriteEffects
+      ...state.ambientReferenceEffects
         .filter(
-          ({ path }) =>
+          ({ path, kind }) =>
+            kind === "write" &&
             path.length <= 2 &&
             path.every((key, index) =>
               semanticPropertyPathKeyMatches(
