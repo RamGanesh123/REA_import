@@ -113,6 +113,69 @@ const cli = async (path: string, extra: string[] = []) => {
   return parseEvidence(JSON.parse(result.stdout));
 };
 
+it("uses HTTP optional whitespace for SAZ identity codings without changing raw headers", async () => {
+  const body = Buffer.from([0, 0, 0, 0, 2, 8, 1]);
+  const codings = [
+    " \tidentity\t ",
+    "\tIdEnTiTy ",
+    " gzip ",
+    " \u00a0identity",
+  ];
+  const entries: [string, Buffer][] = codings.map((coding, index) => [
+    `raw/${index + 1}_s.txt`,
+    Buffer.concat([
+      Buffer.from(
+        `HTTP/1.1 200 OK\r\nContent-Type: application/grpc\r\nContent-Encoding:${coding}\r\nContent-Length: ${body.length}\r\n\r\n`,
+        "latin1",
+      ),
+      body,
+    ]),
+  ]);
+  const path = await fixture(await archive(entries));
+  const evidence = await cli(path, [
+    "--record",
+    "0",
+    "--record",
+    "1",
+    "--record",
+    "2",
+    "--record",
+    "3",
+    "--protobuf-framing",
+    "grpc",
+  ]);
+  const capture = webNetworkCaptureSchema.parse(evidence.normalized_result);
+  for (const [index, coding] of codings.entries()) {
+    expect(capture.records[index]?.reported).toMatchObject({
+      response: {
+        headers: expect.arrayContaining([
+          { name: "Content-Encoding", value: coding },
+        ]),
+      },
+    });
+    if (index < 2)
+      expect(capture.records[index]?.protobuf).toMatchObject([
+        {
+          pointer: "/response/body",
+          status: "complete",
+          fields: [{ number: 1, value: "1" }],
+        },
+      ]);
+    else expect(capture.records[index]?.protobuf).toBeUndefined();
+  }
+  const { call } = await connectLocalToolsMcp();
+  const response = await call("inspect_web_network_capture", {
+    capture_path: path,
+    format: "saz",
+    record_ordinals: [0, 1, 2, 3],
+    protobuf: { framing: "grpc" },
+  });
+  expect(response.isError, JSON.stringify(response)).not.toBe(true);
+  expect(parseEvidence(response.structuredContent).evidence_id).toBe(
+    evidence.evidence_id,
+  );
+});
+
 it("inspects native SAZ through the public CLI and MCP with equal evidence, bytes and archive coordinates", async () => {
   const bytes = await archive();
   const path = await fixture(bytes);
