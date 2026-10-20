@@ -76,6 +76,49 @@ cliTest(
   30000,
 );
 
+for (const bits of [32, 64] as const) {
+  for (const encoding of ["inline", "pointer"] as const) {
+    cliTest(
+      `retains PE ${bits} ${encoding} metadata with zero virtual size through CLI and MCP`,
+      async ({ cli }) => {
+        const root = await createTestTempDirectory("rea-go-pe-zero-");
+        const fixture = createGoBinaryFixture({ format: "pe", bits, encoding });
+        const { client, call } = await connectLocalToolsMcp();
+        const infos = [];
+        const section = 152 + fixture.bytes.readUInt16LE(148);
+        for (const virtualSize of [2048, 0]) {
+          fixture.bytes.writeUInt32LE(virtualSize, section + 8);
+          const path = join(root, `section-${virtualSize}.exe`);
+          await writeFile(path, fixture.bytes);
+          const result = await cli.run({
+            arguments: ["inspect-go-binary", path, "--json"],
+          });
+          expect(result.exitCode, result.stderr).toBe(0);
+          const evidence = toolContract("inspect_go_binary").outputSchema.parse(
+            result.json,
+          );
+          expect(evidence.subject?.digest.sha256).toBe(
+            createHash("sha256").update(fixture.bytes).digest("hex"),
+          );
+          expect(evidence.normalized_result.build_info).toMatchObject({
+            go_version: "go1.26.0",
+            encoding,
+            header_offset: fixture.headerOffset,
+            module_text: GO_MODULE_TEXT,
+          });
+          infos.push(evidence.normalized_result.build_info);
+          const response = await call("inspect_go_binary", { path });
+          expect(response.isError, JSON.stringify(response)).not.toBe(true);
+          expect(response.structuredContent).toEqual(evidence);
+        }
+        expect(infos[1]).toEqual(infos[0]);
+        await client.ping();
+      },
+      30000,
+    );
+  }
+}
+
 for (const expectedErrno of ["ELOOP", "ENAMETOOLONG"] as const) {
   cliTest.skipIf(expectedErrno === "ELOOP" && process.platform === "win32")(
     `reports native ${expectedErrno} path failure as invalid selected-path input through the public Go CLI`,

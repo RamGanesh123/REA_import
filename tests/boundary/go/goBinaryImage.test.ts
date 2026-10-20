@@ -668,6 +668,35 @@ it.each(["elf", "pe", "macho"] as const)(
   },
 );
 
+it.each([
+  [32, "inline"],
+  [32, "pointer"],
+  [64, "inline"],
+  [64, "pointer"],
+] as const)(
+  "retains PE %d %s metadata when the data section virtual size is zero",
+  (bits, encoding) => {
+    const fixture = createGoBinaryFixture({ format: "pe", bits, encoding });
+    const expected = readGoBinaryImage(fixture.bytes).build_info;
+    expect(expected).not.toBeNull();
+    const section = 152 + fixture.bytes.readUInt16LE(148);
+    fixture.bytes.writeUInt32LE(0, section + 8);
+    expect(readGoBinaryImage(fixture.bytes).build_info).toEqual(expected);
+  },
+);
+
+it.each([32, 64] as const)(
+  "does not discover PE %d metadata in raw padding beyond a nonzero virtual size",
+  (bits) => {
+    const fixture = createGoBinaryFixture({ format: "pe", bits });
+    const section = 152 + fixture.bytes.readUInt16LE(148);
+    fixture.bytes.writeUInt32LE(16, section + 8);
+    fixture.bytes.writeUInt32LE(512, section + 12);
+    fixture.bytes.writeUInt32LE(512, section + 20);
+    expect(readGoBinaryImage(fixture.bytes).build_info).toBeNull();
+  },
+);
+
 it("does not infer PE zero-fill from raw padding beyond a smaller virtual size", () => {
   const fixture = createGoBinaryFixture({ format: "pe", encoding: "pointer" });
   fixture.bytes.writeUInt32LE(1024, 264 + 8);
